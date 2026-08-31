@@ -98,6 +98,13 @@ class ViewerModelTests(unittest.TestCase):
         visible = self.model.set_filter("bookmarked_only", True)
         self.assertEqual([item.session_id for item in visible], [session.session_id])
 
+    def test_activity_subset_can_include_exact_cross_date_sessions(self) -> None:
+        session = self.model.sessions[-1]
+        visible = self.model.set_session_subset(frozenset({session.session_id}))
+        self.assertEqual([item.session_id for item in visible], [session.session_id])
+        self.model.set_session_subset(None)
+        self.assertEqual(len(self.model.sessions), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

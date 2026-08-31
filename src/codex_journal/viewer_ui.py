@@ -16,6 +16,7 @@ from .viewer_actions import (
     copy_selected_range,
     project_directory_uri,
 )
+from .viewer_activity import ActivityBucket, ActivityReport, build_activity_report, fill_daily_range
 from .viewer_annotations import AnnotationStore, AnnotationTarget
 from .viewer_catalog import (
     CatalogError,
@@ -77,6 +78,8 @@ class JournalWindow:
         self._pending_note_delete: AnnotationTarget | None = None
         self._recent_session_ids: list[str] = []
         self._comparison_report: ComparisonReport | None = None
+        self._activity_report: ActivityReport | None = None
+        self._activity_running = False
         self._session_rows: dict[object, str] = {}
         self._filter_widgets: dict[str, object] = {}
         self._hits_by_session: dict[str, SearchHit] = {}
@@ -155,6 +158,7 @@ class JournalWindow:
                 ("<Ctrl><Shift>b",),
             ),
             ("compare", lambda *_args: self._compare_recent(), ("<Ctrl><Shift>c",)),
+            ("activity", lambda *_args: self._open_activity(), ("<Ctrl><Shift>a",)),
             ("toggle-details", lambda *_args: self._toggle_details(), ("<Ctrl>d",)),
             ("help", lambda *_args: self._show_shortcuts(), ("<Ctrl><Shift>slash",)),
             ("cycle-theme", lambda *_args: self._cycle_theme(), ("<Ctrl><Shift>t",)),
@@ -259,6 +263,7 @@ class JournalWindow:
             ("Toggle session details", "<Ctrl>d"),
             ("Cycle system/light/dark theme", "<Ctrl><Shift>t"),
             ("Compare two most recently viewed sessions", "<Ctrl><Shift>c"),
+            ("Open daily, weekly, and project activity", "<Ctrl><Shift>a"),
             ("Show this help", "<Ctrl><Shift>slash"),
         ):
             group.add_shortcut(
@@ -430,6 +435,13 @@ class JournalWindow:
         self._accessible(self.compare_button, "Compare two most recently viewed sessions")
         self.compare_button.connect("clicked", lambda *_args: self._compare_recent())
         header.pack_end(self.compare_button)
+        self.activity_button = self.Gtk.Button(
+            icon_name="x-office-calendar-symbolic",
+            tooltip_text="Open daily, weekly, and project activity",
+        )
+        self._accessible(self.activity_button, "Open journal activity calendar")
+        self.activity_button.connect("clicked", lambda *_args: self._open_activity())
+        header.pack_end(self.activity_button)
         toolbar.add_top_bar(header)
 
         self.main_stack = self.Gtk.Stack()
@@ -490,6 +502,7 @@ class JournalWindow:
         self._loading = True
         try:
             self.catalog.refresh()
+            self._activity_report = None
             self.model = SessionBrowserModel(self.catalog)
             self.model.set_bookmarked_session_ids(self.annotations.bookmarked_session_ids())
             if self.search_index is not None:
@@ -1010,6 +1023,175 @@ class JournalWindow:
         label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         label.set_hexpand(True)
         return label
+
+    def _open_activity(self) -> None:
+        if self._activity_report is None:
+            if self._activity_running:
+                return
+            self._activity_running = True
+            self.current_detail = None
+            self._clear_box(self.content_box)
+            loading = self.Adw.StatusPage(
+                title="Building journal activity",
+                description="Counting generated sessions and visible entries in a worker.",
+                icon_name="content-loading-symbolic",
+            )
+            loading.set_vexpand(True)
+            self.content_box.append(loading)
+            self._show_state("content")
+            Thread(target=self._activity_worker, daemon=True).start()
+            return
+        self._build_activity_view()
+
+    def _activity_worker(self) -> None:
+        try:
+            catalog = JournalCatalog(self.repo_root)
+            catalog.refresh()
+            report = build_activity_report(catalog)
+            self.GLib.idle_add(self._finish_activity, report, None)
+        except Exception as exc:  # worker boundary reports no private path or content
+            self.GLib.idle_add(self._finish_activity, None, type(exc).__name__)
+
+    def _finish_activity(
+        self, report: ActivityReport | None, failure: str | None
+    ) -> bool:
+        self._activity_running = False
+        if self._closed:
+            return False
+        if report is None:
+            self._clear_box(self.content_box)
+            error = self.Adw.StatusPage(
+                title="Activity view unavailable",
+                description=f"Generated activity failed safely ({failure or 'unknown error'}).",
+                icon_name="dialog-warning-symbolic",
+            )
+            self.content_box.append(error)
+            return False
+        self._activity_report = report
+        self._build_activity_view()
+        return False
+
+    def _build_activity_view(self) -> None:
+        self.current_detail = None
+        self._clear_box(self.content_box)
+        title = self.Gtk.Label(label="Journal activity", xalign=0)
+        title.add_css_class("title-1")
+        self.content_box.append(title)
+        notice = self.Gtk.Label(
+            label=(
+                "Deterministic counts from generated sessions and visible entries only. "
+                "No productivity score, sentiment, or hidden-activity inference."
+            ),
+            xalign=0,
+            wrap=True,
+        )
+        notice.add_css_class("dim-label")
+        self.content_box.append(notice)
+        controls = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=10)
+        controls.append(self.Gtk.Label(label="Period", xalign=0))
+        self.activity_period = self.Gtk.DropDown.new_from_strings(["Daily", "Weekly"])
+        self.activity_period.connect("notify::selected", self._on_activity_filter)
+        controls.append(self.activity_period)
+        controls.append(self.Gtk.Label(label="Project calendar", xalign=0))
+        projects = [calendar.project for calendar in self._activity_report.projects]
+        self.activity_project = self.Gtk.DropDown.new_from_strings([ALL, *projects])
+        self.activity_project.connect("notify::selected", self._on_activity_filter)
+        controls.append(self.activity_project)
+        self.content_box.append(controls)
+        self.activity_list = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=8)
+        self.content_box.append(self.activity_list)
+        self._render_activity()
+        self._show_state("content")
+
+    def _on_activity_filter(self, *_args: object) -> None:
+        self._render_activity()
+
+    def _render_activity(self) -> None:
+        report = self._activity_report
+        if report is None or not hasattr(self, "activity_list"):
+            return
+        self._clear_box(self.activity_list)
+        project = self._selected_text(self.activity_project)
+        period = self._selected_text(self.activity_period)
+        if project and project != ALL:
+            calendar = next(item for item in report.projects if item.project == project)
+            buckets = calendar.days
+            heading = f"{project} · project calendar"
+        elif period == "Weekly":
+            buckets = report.weeks
+            heading = "All projects · ISO weeks"
+        elif report.days:
+            ascending = fill_daily_range(report, report.days[-1].key, report.days[0].key)
+            buckets = tuple(reversed(ascending))
+            heading = "All projects · calendar days"
+        else:
+            buckets = ()
+            heading = "No generated activity"
+        label = self.Gtk.Label(label=heading, xalign=0)
+        label.add_css_class("title-2")
+        self.activity_list.append(label)
+        if not buckets:
+            empty = self.Gtk.Label(
+                label="This period has no generated sessions or visible entries.", xalign=0
+            )
+            empty.add_css_class("dim-label")
+            self.activity_list.append(empty)
+            return
+        for bucket in buckets:
+            self.activity_list.append(self._activity_row(bucket))
+
+    def _activity_row(self, bucket: ActivityBucket) -> object:
+        row = self.Gtk.Box(
+            orientation=self.Gtk.Orientation.HORIZONTAL,
+            spacing=12,
+            margin_top=8,
+            margin_bottom=8,
+            margin_start=10,
+            margin_end=10,
+        )
+        row.add_css_class("card")
+        body = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=4)
+        body.set_hexpand(True)
+        title = self.Gtk.Label(label=bucket.key, xalign=0)
+        title.add_css_class("heading")
+        body.append(title)
+        statuses = ", ".join(f"{name} {count}" for name, count in bucket.statuses) or "no sessions"
+        body.append(
+            self.Gtk.Label(
+                label=(
+                    f"{len(bucket.session_ids)} session(s) · {bucket.entries} visible entries · "
+                    f"{statuses}"
+                ),
+                xalign=0,
+                wrap=True,
+            )
+        )
+        projects = ", ".join(f"{name} {count}" for name, count in bucket.projects)
+        tags = ", ".join(f"{name} {count}" for name, count in bucket.tags)
+        details = self.Gtk.Label(
+            label=f"Projects: {projects or 'none'}\nTags: {tags or 'none'}",
+            xalign=0,
+            wrap=True,
+        )
+        details.add_css_class("caption")
+        body.append(details)
+        row.append(body)
+        open_button = self.Gtk.Button(label="View sessions")
+        open_button.set_sensitive(bool(bucket.session_ids))
+        open_button.connect("clicked", lambda _button, item=bucket: self._navigate_activity(item))
+        row.append(open_button)
+        return row
+
+    def _navigate_activity(self, bucket: ActivityBucket) -> None:
+        self.current_entry_index = 0
+        self.search_entry.set_text("")
+        self.model = SessionBrowserModel(self.catalog)
+        self.model.set_bookmarked_session_ids(self.annotations.bookmarked_session_ids())
+        self.model.set_session_subset(frozenset(bucket.session_ids))
+        self._hits_by_session.clear()
+        self._populate_sessions()
+        if self.split.get_collapsed():
+            self.split.set_show_content(False)
 
     def _timeline_row(self, session: CatalogSession, presented: PresentedEntry) -> object:
         row = self.Gtk.Expander()

@@ -40,6 +40,7 @@ class SessionBrowserModel:
         self.selected_session_id: str | None = None
         self._search_matches: dict[str, int] | None = None
         self._bookmarked_session_ids: frozenset[str] = frozenset()
+        self._session_subset: frozenset[str] | None = None
 
     @property
     def sessions(self) -> tuple[CatalogSession, ...]:
@@ -57,6 +58,7 @@ class SessionBrowserModel:
             and (not filters.extraction_errors_only or session.extraction_error_count > 0)
             and (not filters.bookmarked_only or session.session_id in self._bookmarked_session_ids)
             and (self._search_matches is None or session.session_id in self._search_matches)
+            and (self._session_subset is None or session.session_id in self._session_subset)
         )
 
     @property
@@ -130,6 +132,13 @@ class SessionBrowserModel:
 
     def set_bookmarked_session_ids(self, session_ids: frozenset[str]) -> tuple[CatalogSession, ...]:
         self._bookmarked_session_ids = session_ids
+        visible = self.sessions
+        if self.selected_session_id not in {session.session_id for session in visible}:
+            self.selected_session_id = visible[0].session_id if visible else None
+        return visible
+
+    def set_session_subset(self, session_ids: frozenset[str] | None) -> tuple[CatalogSession, ...]:
+        self._session_subset = session_ids
         visible = self.sessions
         if self.selected_session_id not in {session.session_id for session in visible}:
             self.selected_session_id = visible[0].session_id if visible else None
