@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from codex_journal.compact import compact_candidates
@@ -15,6 +16,7 @@ from codex_journal.model import Candidate
 from codex_journal.parser import duplicate_session_ids
 from codex_journal.redact import redact_text, shorten_home
 from codex_journal.render import atomic_write, parse_front_matter
+from codex_journal.viewer import ViewerUnavailable, load_gtk
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -385,6 +387,33 @@ class PrivacyAndIndexTests(JournalTestCase):
                 "15:31  Three focused offline contracts passed.",
             ],
         )
+
+
+class ViewerFoundationTests(unittest.TestCase):
+    def test_view_command_is_registered(self) -> None:
+        from codex_journal.cli import build_parser
+
+        args = build_parser().parse_args(["view"])
+        self.assertEqual(args.command, "view")
+
+    def test_optional_gtk_import_fails_with_setup_guidance(self) -> None:
+        def unavailable(_name: str) -> object:
+            raise ModuleNotFoundError("optional dependency absent")
+
+        with self.assertRaisesRegex(ViewerUnavailable, "mise run bootstrap"):
+            load_gtk(unavailable)
+
+    def test_optional_gtk_import_requests_supported_versions(self) -> None:
+        requested: list[tuple[str, str]] = []
+        gi = SimpleNamespace(require_version=lambda name, version: requested.append((name, version)))
+        repository = SimpleNamespace(Adw=object(), Gio=object(), Gtk=object())
+
+        def available(name: str) -> object:
+            return gi if name == "gi" else repository
+
+        modules = load_gtk(available)
+        self.assertEqual(requested, [("Gtk", "4.0"), ("Adw", "1")])
+        self.assertEqual(len(modules), 3)
 
 
 if __name__ == "__main__":

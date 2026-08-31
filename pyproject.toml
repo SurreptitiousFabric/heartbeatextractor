@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+viewer = ["PyGObject>=3.54,<4"]
+
 [project.scripts]
 codex-journal = "codex_journal.cli:main"
 

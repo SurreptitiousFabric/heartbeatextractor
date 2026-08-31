@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--session", required=name == "rebuild")
         command.add_argument("--timezone")
     subparsers.add_parser("verify")
+    subparsers.add_parser("view", help="open the optional native GTK journal viewer")
     return parser
 
 
@@ -44,6 +45,14 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = (args.repo_root or repository_root()).expanduser()
     state_root = (args.codex_home or default_state_root()).expanduser()
     engine = JournalEngine(repo_root, state_root)
+    if args.command == "view":
+        from .viewer import ViewerUnavailable, run_viewer
+
+        try:
+            return run_viewer(repo_root.resolve(), state_root.resolve())
+        except ViewerUnavailable as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     if args.command == "discover":
         sessions, errors = engine.discover()
         if args.session:
