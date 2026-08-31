@@ -50,6 +50,11 @@ class ViewerPresenterTests(unittest.TestCase):
         self.assertIn("#35", text)
         self.assertIn("abc123", text)
 
+    def test_filename_and_bare_commit_hash_are_visually_tagged(self) -> None:
+        tags = classify_entry("Updated src/viewer.py at deadbeef without opening a link.")
+        self.assertIn("filename", tags)
+        self.assertIn("commit", tags)
+
     def test_dst_fallback_keeps_repeated_minutes_as_distinct_entries(self) -> None:
         first = entry(0, "2026-10-25T00:00:00Z", "First repeated minute.")
         second = entry(1, "2026-10-25T01:00:00Z", "Second repeated minute.")

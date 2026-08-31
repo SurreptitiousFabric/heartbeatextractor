@@ -10,6 +10,12 @@ from typing import Any
 from gi.repository import Pango
 
 from .engine import JournalEngine
+from .viewer_actions import (
+    ProjectPathError,
+    copy_one_entry,
+    copy_selected_range,
+    project_directory_uri,
+)
 from .viewer_catalog import (
     CatalogError,
     CatalogSession,
@@ -55,6 +61,9 @@ class JournalWindow:
         self._state_restored = False
         self._timeline_widgets: dict[int, object] = {}
         self.details_expander: object | None = None
+        self.current_detail: object | None = None
+        self._selected_entry_indexes: set[int] = set()
+        self.action_status: object | None = None
         self._session_rows: dict[object, str] = {}
         self._filter_widgets: dict[str, object] = {}
         self._hits_by_session: dict[str, SearchHit] = {}
@@ -119,6 +128,13 @@ class JournalWindow:
             ("focus-search", lambda *_args: self.search_entry.grab_focus(), ("<Ctrl>f", "slash")),
             ("refresh", lambda *_args: self.refresh_catalog(), ("F5",)),
             ("sync", lambda *_args: self._start_sync(), ("<Ctrl>r",)),
+            ("open-project", lambda *_args: self._open_project(), ("<Ctrl>o",)),
+            ("copy-entry", lambda *_args: self._copy_current_entry(), ("<Ctrl><Alt>c",)),
+            (
+                "copy-range",
+                lambda *_args: self._copy_selected_range(),
+                ("<Ctrl><Alt><Shift>c",),
+            ),
             ("toggle-details", lambda *_args: self._toggle_details(), ("<Ctrl>d",)),
             ("help", lambda *_args: self._show_shortcuts(), ("<Ctrl><Shift>slash",)),
             ("cycle-theme", lambda *_args: self._cycle_theme(), ("<Ctrl><Shift>t",)),
@@ -223,6 +239,9 @@ class JournalWindow:
             ("Focus search (/ also works)", "<Ctrl>f"),
             ("Refresh generated journals", "F5"),
             ("Sync source sessions", "<Ctrl>r"),
+            ("Open validated project directory", "<Ctrl>o"),
+            ("Copy current sanitized entry", "<Ctrl><Alt>c"),
+            ("Copy selected sanitized range", "<Ctrl><Alt><Shift>c"),
             ("Toggle session details", "<Ctrl>d"),
             ("Cycle system/light/dark theme", "<Ctrl><Shift>t"),
             ("Compare sessions (available in comparison view)", "<Ctrl><Shift>c"),
@@ -355,6 +374,25 @@ class JournalWindow:
         back.connect("clicked", lambda *_args: self.split.set_show_content(False))
         self._accessible(back, "Back to session list")
         header.pack_start(back)
+        self.open_project_button = self.Gtk.Button(
+            icon_name="folder-open-symbolic", tooltip_text="Open validated project directory"
+        )
+        self._accessible(self.open_project_button, "Open validated project directory")
+        self.open_project_button.connect("clicked", lambda *_args: self._open_project())
+        header.pack_end(self.open_project_button)
+        self.copy_entry_button = self.Gtk.Button(
+            icon_name="edit-copy-symbolic", tooltip_text="Copy current sanitized entry"
+        )
+        self._accessible(self.copy_entry_button, "Copy current sanitized entry")
+        self.copy_entry_button.connect("clicked", lambda *_args: self._copy_current_entry())
+        header.pack_end(self.copy_entry_button)
+        self.copy_range_button = self.Gtk.Button(
+            icon_name="edit-select-all-symbolic",
+            tooltip_text="Copy selected sanitized entry range",
+        )
+        self._accessible(self.copy_range_button, "Copy selected sanitized entry range")
+        self.copy_range_button.connect("clicked", lambda *_args: self._copy_selected_range())
+        header.pack_end(self.copy_range_button)
         toolbar.add_top_bar(header)
 
         self.main_stack = self.Gtk.Stack()
@@ -708,6 +746,7 @@ class JournalWindow:
         if session_id != self.model.selected_session_id:
             self.current_entry_index = 0
         self.model.select(session_id)
+        self._selected_entry_indexes.clear()
         self._render_session(session_id)
         if self.split.get_collapsed():
             self.split.set_show_content(True)
@@ -725,6 +764,7 @@ class JournalWindow:
             return
         self._clear_box(self.content_box)
         self._timeline_widgets.clear()
+        self.current_detail = detail
         session = detail.session
         title = self.Gtk.Label(label=session.project, xalign=0, selectable=True)
         title.add_css_class("title-1")
@@ -736,6 +776,9 @@ class JournalWindow:
         )
         subtitle.add_css_class("dim-label")
         self.content_box.append(subtitle)
+        self.action_status = self.Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
+        self.action_status.add_css_class("caption")
+        self.content_box.append(self.action_status)
         if session.redaction_count or session.extraction_error_count:
             warning = self.Adw.Banner.new(
                 f"{session.redaction_count} redaction(s) · "
@@ -784,6 +827,9 @@ class JournalWindow:
         details.set_child(self._details_grid(session))
         self.details_expander = details
         self.content_box.append(details)
+        relationships = self._relationship_box(session)
+        if relationships is not None:
+            self.content_box.append(relationships)
         if detail.extraction_errors:
             errors = self.Gtk.Expander(
                 label=f"Extraction errors ({len(detail.extraction_errors)})"
@@ -817,6 +863,9 @@ class JournalWindow:
             margin_start=12,
             margin_end=12,
         )
+        selected = self.Gtk.CheckButton()
+        self._accessible(selected, f"Include journal entry at {presented.display_time} in copy range")
+        selected.connect("toggled", self._on_entry_selected, presented.entry.index)
         timestamp = self.Gtk.Label(label=presented.display_time, xalign=0, yalign=0)
         timestamp.add_css_class("monospace")
         timestamp.add_css_class("dim-label")
@@ -835,12 +884,101 @@ class JournalWindow:
             if "failure" in labels or "security" in labels or "redacted" in labels:
                 tags.add_css_class("warning")
             body.append(tags)
+        heading.append(selected)
         heading.append(timestamp)
         heading.append(body)
         row.set_label_widget(heading)
         row.set_child(self._provenance_grid(session, presented))
         row.connect("notify::expanded", self._on_entry_expanded, presented.entry.index)
         return row
+
+    def _on_entry_selected(self, button: object, entry_index: int) -> None:
+        if button.get_active():
+            self._selected_entry_indexes.add(entry_index)
+        else:
+            self._selected_entry_indexes.discard(entry_index)
+
+    def _set_action_status(self, message: str, *, warning: bool = False) -> None:
+        if self.action_status is None:
+            return
+        self.action_status.set_label(message)
+        if warning:
+            self.action_status.add_css_class("warning")
+        else:
+            self.action_status.remove_css_class("warning")
+
+    def _open_project(self) -> None:
+        session = self.model.selected
+        try:
+            uri = project_directory_uri(
+                session.working_directory if session else None, home=Path.home()
+            )
+            self.Gio.AppInfo.launch_default_for_uri(uri, None)
+            self._set_action_status("Opened the validated local project directory.")
+        except ProjectPathError as exc:
+            self._set_action_status(str(exc), warning=True)
+        except Exception:
+            self._set_action_status("The desktop file manager could not open the directory.", warning=True)
+
+    def _copy_current_entry(self) -> None:
+        detail = self.current_detail
+        if detail is None or not detail.entries:
+            self._set_action_status("No sanitized timeline entry is available to copy.", warning=True)
+            return
+        entry = next(
+            (item for item in detail.entries if item.index == self.current_entry_index),
+            detail.entries[0],
+        )
+        payload = copy_one_entry(entry)
+        self.window.get_clipboard().set(payload.text)
+        self._set_action_status("Copied 1 sanitized journal entry with its timestamp.")
+
+    def _copy_selected_range(self) -> None:
+        detail = self.current_detail
+        try:
+            if detail is None:
+                raise ValueError("No timeline entries are selected.")
+            payload = copy_selected_range(detail.entries, self._selected_entry_indexes)
+        except ValueError as exc:
+            self._set_action_status(str(exc), warning=True)
+            return
+        self.window.get_clipboard().set(payload.text)
+        self._set_action_status(
+            f"Copied {payload.entry_count} sanitized journal entries with timestamps."
+        )
+
+    def _relationship_box(self, session: CatalogSession) -> object | None:
+        parent = self.catalog.parent_of(session.session_id)
+        children = self.catalog.children_of(session.session_id)
+        if parent is None and not children:
+            return None
+        section = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=6)
+        heading = self.Gtk.Label(label="Related sessions", xalign=0)
+        heading.add_css_class("heading")
+        section.append(heading)
+        if parent is not None:
+            button = self.Gtk.Button(label=f"Parent · {parent.session_id}")
+            button.set_halign(self.Gtk.Align.START)
+            button.connect("clicked", lambda _button, target=parent.session_id: self._navigate_related(target))
+            section.append(button)
+        for child in children:
+            button = self.Gtk.Button(label=f"Sub-agent · {child.session_id}")
+            button.set_halign(self.Gtk.Align.START)
+            button.connect("clicked", lambda _button, target=child.session_id: self._navigate_related(target))
+            section.append(button)
+        return section
+
+    def _navigate_related(self, session_id: str) -> None:
+        self.current_entry_index = 0
+        self.search_entry.set_text("")
+        for dropdown in self._filter_widgets.values():
+            dropdown.set_selected(0)
+        self.redacted_check.set_active(False)
+        self.errors_check.set_active(False)
+        self.model = SessionBrowserModel(self.catalog)
+        self._hits_by_session.clear()
+        self.model.select(session_id)
+        self._populate_sessions()
 
     def _on_entry_expanded(
         self, row: object, _pspec: object, entry_index: int

@@ -9,9 +9,10 @@ TAG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("security", re.compile(r"\b(?:security|credential|secret|token|permission|fail-open|vulnerab\w*)\b", re.IGNORECASE)),
     ("blocker", re.compile(r"\b(?:blocker(?:s)?|blocked|objection(?:s)?)\b", re.IGNORECASE)),
     ("correction", re.compile(r"\b(?:correct(?:ed|ion)?|fix(?:ed)?|withdrawn|retracted)\b", re.IGNORECASE)),
-    ("commit", re.compile(r"\b(?:commit(?:ted)?|push(?:ed)?)\b", re.IGNORECASE)),
+    ("commit", re.compile(r"(?:\b(?:commit(?:ted)?|push(?:ed)?)\b|\b[0-9a-f]{7,40}\b)", re.IGNORECASE)),
     ("issue/PR", re.compile(r"(?:\bissue(?:s)?\b|\bpull request(?:s)?\b|\bPRs?\b|#[0-9]+)", re.IGNORECASE)),
     ("stop", re.compile(r"\b(?:stop(?:ped|ping)?|paused|halted|remains un(?:committed|integrated|executed))\b", re.IGNORECASE)),
+    ("filename", re.compile(r"(?:^|\s)[\w./-]+\.(?:py|rs|go|js|ts|tsx|jsx|md|toml|yaml|yml|json|sh|c|h|cpp)(?=\s|[,:;.)]|$)", re.IGNORECASE)),
 )
 
 TAGS = tuple(label for label, _pattern in TAG_PATTERNS)
