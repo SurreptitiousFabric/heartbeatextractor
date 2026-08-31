@@ -132,6 +132,12 @@ also stores the processed byte offset and SHA-256 of that exact processed
 prefix. A larger file with a matching processed prefix is append-only. A
 shorter file or prefix mismatch is a truncation/replacement and is rebuilt.
 
+Verification compares the generated fingerprint with the exact source byte
+snapshot recorded by sync. If the recorded prefix still matches but the active
+source has grown, verification reports an append warning rather than claiming
+corruption. A shorter source, changed recorded prefix, or disagreement between
+generated metadata and processing state remains an error.
+
 Records are read with a fixed maximum size. Malformed JSON, non-object JSON,
 oversized lines, missing timestamps, and invalid visible-message shapes become
 recorded extraction errors. They are never silently converted into journal
