@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+
+from codex_journal.engine import JournalEngine
+from codex_journal.viewer_catalog import CatalogError, JournalCatalog, JournalSearchIndex
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class ViewerCatalogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.source = self.root / "codex-state"
+        (self.repo / "journal").mkdir(parents=True)
+        (self.repo / "projects").mkdir()
+        (self.repo / "state").mkdir()
+        (self.repo / "INDEX.md").write_text("# Codex session journals\n", encoding="utf-8")
+        target = self.source / "sessions" / "2026" / "08" / "31"
+        target.mkdir(parents=True)
+        shutil.copyfile(FIXTURES / "normal_completed.jsonl", target / "normal.jsonl")
+        shutil.copyfile(FIXTURES / "subagent.jsonl", target / "subagent.jsonl")
+        JournalEngine(self.repo, self.source, home=Path("/home/tester")).sync(timezone_name="Europe/Zurich")
+        self.catalog = JournalCatalog(self.repo)
+        self.catalog.refresh()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_metadata_is_eager_but_timelines_are_lazy(self) -> None:
+        self.assertEqual(len(self.catalog.sessions), 2)
+        self.assertFalse(self.catalog.diagnostics)
+        self.assertEqual(self.catalog._details, {})
+        session = self.catalog.sessions[0]
+        self.assertIn(session.source_kind, {"cli", "subagent"})
+        detail = self.catalog.load_detail(session.session_id)
+        self.assertEqual(len(detail.entries), session.entry_count)
+        self.assertIn(session.session_id, self.catalog._details)
+
+    def test_parent_child_and_project_indexes_use_generated_metadata(self) -> None:
+        parent = next(session for session in self.catalog.sessions if self.catalog.children_of(session.session_id))
+        children = self.catalog.children_of(parent.session_id)
+        self.assertTrue(children)
+        self.assertTrue(all(self.catalog.parent_of(child.session_id) == parent for child in children))
+        self.assertTrue(self.catalog.projects)
+
+    def test_search_index_contains_only_sanitized_generated_text(self) -> None:
+        raw_secret = "RAW_PROMPT_MUST_NEVER_ENTER_VIEWER"
+        (self.source / "unrelated-private-record.jsonl").write_text(raw_secret, encoding="utf-8")
+        database = self.repo / "state" / "viewer.sqlite3"
+        with JournalSearchIndex(database) as index:
+            count = index.rebuild(self.catalog)
+            self.assertGreater(count, 0)
+            first = self.catalog.load_detail(self.catalog.sessions[0].session_id).entries[0]
+            term = first.text.split()[0].strip(".,:;!?")
+            self.assertTrue(index.search(term))
+            self.assertFalse(index.search(raw_secret))
+        self.assertNotIn(raw_secret.encode(), database.read_bytes())
+
+    def test_malformed_generated_artifact_fails_closed(self) -> None:
+        malformed = self.repo / "journal" / "bad.md"
+        malformed.write_text("---\nsession_id: not-json\n---\nprivate body\n", encoding="utf-8")
+        self.catalog.refresh()
+        self.assertEqual(len(self.catalog.sessions), 2)
+        self.assertTrue(any("bad.md" in diagnostic and "malformed metadata" in diagnostic for diagnostic in self.catalog.diagnostics))
+
+    def test_detail_size_limit_is_enforced(self) -> None:
+        session = self.catalog.sessions[0]
+        limited = JournalCatalog(self.repo, max_journal_bytes=1)
+        limited.refresh()
+        with self.assertRaisesRegex(CatalogError, "generated journal exceeds size limit"):
+            limited.load_detail(session.session_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

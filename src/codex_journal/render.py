@@ -121,6 +121,7 @@ def render_journal(
         ("working_directory", shorten_home(cache.working_directory, home)),
         ("repository", cache.repository),
         ("branch", cache.branch),
+        ("source_kind", cache.source_kind),
         ("source_fingerprint", cache.source_fingerprint),
         ("timeline_entries", len(entries)),
         ("redactions", cache.redaction_count),
