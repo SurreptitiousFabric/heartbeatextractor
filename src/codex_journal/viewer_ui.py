@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+
+from gi.repository import Pango
 
 from .viewer_catalog import (
     CatalogError,
@@ -15,6 +18,7 @@ from .viewer_catalog import (
 from .viewer_model import ALL, SessionBrowserModel, display_start, session_badges
 from .viewer_presenter import PresentedEntry, present_timeline
 from .viewer_tags import TAGS
+from .viewer_state import ViewerState, ViewerStateStore
 
 
 class JournalWindow:
@@ -23,8 +27,16 @@ class JournalWindow:
     def __init__(self, application: object, repo_root: Path, modules: tuple[Any, ...]) -> None:
         self.Adw, self.Gio, self.GLib, self.Gtk = modules
         self.repo_root = repo_root
+        self.application = application
         self.catalog = JournalCatalog(repo_root)
         self.model = SessionBrowserModel(self.catalog)
+        self.state_store = ViewerStateStore(repo_root / "state" / "viewer-state.json")
+        self.saved_state = self.state_store.load()
+        self.theme = self.saved_state.theme
+        self.current_entry_index = self.saved_state.timeline_entry_index
+        self._state_restored = False
+        self._timeline_widgets: dict[int, object] = {}
+        self.details_expander: object | None = None
         self._session_rows: dict[object, str] = {}
         self._filter_widgets: dict[str, object] = {}
         self._hits_by_session: dict[str, SearchHit] = {}
@@ -33,34 +45,192 @@ class JournalWindow:
 
         self.window = self.Adw.ApplicationWindow(application=application)
         self.window.set_title("Heartbeat Extractor")
-        self.window.set_default_size(1180, 760)
+        self.window.set_default_size(
+            self.saved_state.window_width, self.saved_state.window_height
+        )
 
         self.split = self.Adw.NavigationSplitView()
-        self.split.set_min_sidebar_width(280)
-        self.split.set_max_sidebar_width(410)
-        self.split.set_sidebar_width_fraction(0.34)
+        self.split.set_min_sidebar_width(220)
+        self.split.set_max_sidebar_width(380)
+        self.split.set_sidebar_width_fraction(0.28)
         self.split.set_sidebar(self.Adw.NavigationPage.new(self._build_sidebar(), "Sessions"))
         self.split.set_content(self.Adw.NavigationPage.new(self._build_main(), "Journal"))
         self.window.set_content(self.split)
         self.window.connect("close-request", self._on_close)
+        self._install_actions()
+        self._apply_theme()
 
         breakpoint = self.Adw.Breakpoint.new(
             self.Adw.BreakpointCondition.parse("max-width: 1000px")
         )
-        breakpoint.add_setter(self.split, "collapsed", True)
+        self._narrow_breakpoint = breakpoint
+        self.split.set_collapsed(True)
         self.window.add_breakpoint(breakpoint)
+        self.window.connect("notify::current-breakpoint", self._on_breakpoint_changed)
+
+        keys = self.Gtk.EventControllerKey.new()
+        keys.connect("key-pressed", self._on_key_pressed)
+        self.window.add_controller(keys)
 
         self._show_state("loading")
         self.GLib.idle_add(self.refresh_catalog)
 
     def present(self) -> None:
         self.window.present()
+        self.GLib.idle_add(self._sync_breakpoint)
+
+    def _on_breakpoint_changed(self, *_args: object) -> None:
+        self._sync_breakpoint()
+
+    def _sync_breakpoint(self) -> bool:
+        self.split.set_collapsed(
+            self.window.get_current_breakpoint() is self._narrow_breakpoint
+        )
+        return False
+
+    def _install_actions(self) -> None:
+        actions: tuple[tuple[str, Callable[..., None], tuple[str, ...]], ...] = (
+            ("previous-session", lambda *_args: self._move_session(-1), ("<Ctrl>Page_Up",)),
+            ("next-session", lambda *_args: self._move_session(1), ("<Ctrl>Page_Down",)),
+            ("previous-entry", lambda *_args: self._move_entry(-1), ("<Alt>Up",)),
+            ("next-entry", lambda *_args: self._move_entry(1), ("<Alt>Down",)),
+            ("focus-search", lambda *_args: self.search_entry.grab_focus(), ("<Ctrl>f", "slash")),
+            ("refresh", lambda *_args: self.refresh_catalog(), ("F5",)),
+            ("toggle-details", lambda *_args: self._toggle_details(), ("<Ctrl>d",)),
+            ("help", lambda *_args: self._show_shortcuts(), ("<Ctrl><Shift>slash",)),
+            ("cycle-theme", lambda *_args: self._cycle_theme(), ("<Ctrl><Shift>t",)),
+        )
+        for name, callback, accelerators in actions:
+            action = self.Gio.SimpleAction.new(name, None)
+            action.connect("activate", callback)
+            self.window.add_action(action)
+            self.application.set_accels_for_action(f"win.{name}", list(accelerators))
+        for name, accelerators in (
+            ("compare", ("<Ctrl><Shift>c",)),
+            ("bookmark", ("<Ctrl>b",)),
+        ):
+            action = self.Gio.SimpleAction.new(name, None)
+            action.set_enabled(False)
+            self.window.add_action(action)
+            self.application.set_accels_for_action(f"win.{name}", list(accelerators))
+
+    def _on_key_pressed(
+        self,
+        _controller: object,
+        keyval: int,
+        _keycode: int,
+        state: object,
+    ) -> bool:
+        focus = self.window.get_focus()
+        if isinstance(focus, (self.Gtk.Entry, self.Gtk.SearchEntry, self.Gtk.TextView)):
+            return False
+        modifiers = int(state) & int(
+            self.Gtk.accelerator_get_default_mod_mask()
+        )
+        if modifiers:
+            return False
+        if keyval in (ord("j"), ord("J"), 0xFF54):
+            self._move_entry(1)
+            return True
+        if keyval in (ord("k"), ord("K"), 0xFF52):
+            self._move_entry(-1)
+            return True
+        return False
+
+    def _move_session(self, delta: int) -> None:
+        sessions = self.model.sessions
+        if not sessions:
+            return
+        ids = [session.session_id for session in sessions]
+        try:
+            current = ids.index(self.model.selected_session_id)
+        except ValueError:
+            current = 0
+        target_id = ids[max(0, min(len(ids) - 1, current + delta))]
+        row = next(
+            (item for item, session_id in self._session_rows.items() if session_id == target_id),
+            None,
+        )
+        if row is not None:
+            self.session_list.select_row(row)
+            row.grab_focus()
+
+    def _move_entry(self, delta: int) -> None:
+        if not self._timeline_widgets:
+            return
+        indexes = sorted(self._timeline_widgets)
+        try:
+            current = indexes.index(self.current_entry_index)
+        except ValueError:
+            current = 0
+        index = indexes[max(0, min(len(indexes) - 1, current + delta))]
+        self.current_entry_index = index
+        widget = self._timeline_widgets[index]
+        widget.set_expanded(True)
+        widget.grab_focus()
+
+    def _toggle_details(self) -> None:
+        if self.details_expander is not None:
+            self.details_expander.set_expanded(not self.details_expander.get_expanded())
+            self.details_expander.grab_focus()
+
+    def _apply_theme(self) -> None:
+        schemes = {
+            "system": self.Adw.ColorScheme.DEFAULT,
+            "light": self.Adw.ColorScheme.FORCE_LIGHT,
+            "dark": self.Adw.ColorScheme.FORCE_DARK,
+        }
+        self.Adw.StyleManager.get_default().set_color_scheme(schemes[self.theme])
+
+    def _cycle_theme(self) -> None:
+        choices = ("system", "light", "dark")
+        self.theme = choices[(choices.index(self.theme) + 1) % len(choices)]
+        self._apply_theme()
+
+    def _show_shortcuts(self) -> None:
+        window = self.Gtk.ShortcutsWindow(transient_for=self.window, modal=True)
+        window.set_title("Heartbeat Extractor shortcuts")
+        section = self.Gtk.ShortcutsSection(section_name="journal", title="Journal browsing")
+        group = self.Gtk.ShortcutsGroup(title="Navigation and actions")
+        for title, accelerator in (
+            ("Previous session", "<Ctrl>Page_Up"),
+            ("Next session", "<Ctrl>Page_Down"),
+            ("Previous entry (K also works)", "<Alt>Up"),
+            ("Next entry (J also works)", "<Alt>Down"),
+            ("Focus search (/ also works)", "<Ctrl>f"),
+            ("Refresh generated journals", "F5"),
+            ("Toggle session details", "<Ctrl>d"),
+            ("Cycle system/light/dark theme", "<Ctrl><Shift>t"),
+            ("Compare sessions (available in comparison view)", "<Ctrl><Shift>c"),
+            ("Bookmark entry (available with annotations)", "<Ctrl>b"),
+            ("Show this help", "<Ctrl><Shift>slash"),
+        ):
+            group.add_shortcut(
+                self.Gtk.ShortcutsShortcut(title=title, accelerator=accelerator)
+            )
+        section.add_group(group)
+        window.add_section(section)
+        window.present()
 
     def _build_sidebar(self) -> object:
         toolbar = self.Adw.ToolbarView()
         header = self.Adw.HeaderBar()
         title = self.Adw.WindowTitle(title="Sessions", subtitle="Generated journals only")
         header.set_title_widget(title)
+        help_button = self.Gtk.Button(
+            icon_name="help-keyboard-shortcuts-symbolic",
+            tooltip_text="Keyboard shortcuts",
+        )
+        self._accessible(help_button, "Show keyboard shortcuts")
+        help_button.connect("clicked", lambda *_args: self._show_shortcuts())
+        header.pack_end(help_button)
+        theme_button = self.Gtk.Button(
+            icon_name="weather-clear-night-symbolic",
+            tooltip_text="Cycle system, light, and dark themes",
+        )
+        self._accessible(theme_button, "Cycle color theme")
+        theme_button.connect("clicked", lambda *_args: self._cycle_theme())
+        header.pack_end(theme_button)
         toolbar.add_top_bar(header)
 
         outer = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=0)
@@ -71,6 +241,7 @@ class JournalWindow:
             margin_end=12,
         )
         self.search_entry.connect("search-changed", self._on_search_changed)
+        self._accessible(self.search_entry, "Search generated journals")
         outer.append(self.search_entry)
         filters = self.Gtk.Box(
             orientation=self.Gtk.Orientation.VERTICAL,
@@ -95,6 +266,7 @@ class JournalWindow:
             dropdown = self.Gtk.DropDown.new_from_strings([ALL])
             dropdown.set_hexpand(True)
             dropdown.connect("notify::selected", self._on_filter_changed, field)
+            self._accessible(dropdown, f"Filter by {label.lower()}")
             self._filter_widgets[field] = dropdown
             row.append(caption)
             row.append(dropdown)
@@ -131,6 +303,7 @@ class JournalWindow:
         header = self.Adw.HeaderBar()
         back = self.Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back to sessions")
         back.connect("clicked", lambda *_args: self.split.set_show_content(False))
+        self._accessible(back, "Back to session list")
         header.pack_start(back)
         toolbar.add_top_bar(header)
 
@@ -187,6 +360,8 @@ class JournalWindow:
     def refresh_catalog(self) -> bool:
         if self._loading:
             return False
+        if self._state_restored:
+            self.saved_state = self._capture_state()
         self._loading = True
         try:
             self.catalog.refresh()
@@ -196,6 +371,9 @@ class JournalWindow:
             self.search_index = JournalSearchIndex(self.repo_root / "state" / "viewer.sqlite3")
             self.search_index.rebuild(self.catalog)
             self._populate_filters()
+            self._restore_state()
+            self._state_restored = True
+            self._apply_search()
             self._populate_sessions()
             if not self.catalog.sessions:
                 if self.catalog.diagnostics:
@@ -211,10 +389,56 @@ class JournalWindow:
         return False
 
     def _on_close(self, *_args: object) -> bool:
+        self.state_store.save(self._capture_state())
         if self.search_index is not None:
             self.search_index.close()
             self.search_index = None
         return False
+
+    def _capture_state(self) -> ViewerState:
+        filters = {
+            key: value
+            for key, value in asdict(self.model.filters).items()
+            if value not in (None, False, "")
+        }
+        return ViewerState(
+            selected_session_id=self.model.selected_session_id,
+            filters=filters,
+            window_width=max(480, self.window.get_width()),
+            window_height=max(480, self.window.get_height()),
+            content_visible=self.split.get_show_content(),
+            timeline_entry_index=self.current_entry_index,
+            theme=self.theme,
+        )
+
+    def _accessible(self, widget: object, label: str) -> None:
+        widget.update_property([self.Gtk.AccessibleProperty.LABEL], [label])
+
+    def _restore_state(self) -> None:
+        for field, value in self.saved_state.filters.items():
+            if field in self._filter_widgets and isinstance(value, str):
+                self._select_dropdown_value(self._filter_widgets[field], value)
+                self.model.set_filter(field, value)
+            elif field == "redacted_only" and isinstance(value, bool):
+                self.redacted_check.set_active(value)
+                self.model.set_filter(field, value)
+            elif field == "extraction_errors_only" and isinstance(value, bool):
+                self.errors_check.set_active(value)
+                self.model.set_filter(field, value)
+        session_id = self.saved_state.selected_session_id
+        if session_id and any(item.session_id == session_id for item in self.model.sessions):
+            self.model.select(session_id)
+        self.split.set_show_content(self.saved_state.content_visible)
+
+    def _select_dropdown_value(self, dropdown: object, value: str) -> None:
+        model = dropdown.get_model()
+        if model is None:
+            return
+        for index in range(model.get_n_items()):
+            item = model.get_item(index)
+            if item is not None and item.get_string() == value:
+                dropdown.set_selected(index)
+                return
 
     def _show_catalog_error(self) -> None:
         count = len(self.catalog.diagnostics)
@@ -345,6 +569,8 @@ class JournalWindow:
         session_id = self._session_rows.get(row)
         if session_id is None:
             return
+        if session_id != self.model.selected_session_id:
+            self.current_entry_index = 0
         self.model.select(session_id)
         self._render_session(session_id)
         if self.split.get_collapsed():
@@ -362,6 +588,7 @@ class JournalWindow:
             self._show_state("error")
             return
         self._clear_box(self.content_box)
+        self._timeline_widgets.clear()
         session = detail.session
         title = self.Gtk.Label(label=session.project, xalign=0, selectable=True)
         title.add_css_class("title-1")
@@ -396,6 +623,8 @@ class JournalWindow:
             timeline = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=8)
             previous_date = None
             target_index = self.model.matching_entry(session.session_id)
+            if target_index is None:
+                target_index = min(self.current_entry_index, max(0, len(detail.entries) - 1))
             target_widget = None
             for presented in present_timeline(detail):
                 if presented.local_date != previous_date:
@@ -409,6 +638,7 @@ class JournalWindow:
                     widget.add_css_class("accent")
                     widget.set_expanded(True)
                     target_widget = widget
+                self._timeline_widgets[presented.entry.index] = widget
                 timeline.append(widget)
             self.content_box.append(timeline)
             if target_widget is not None:
@@ -416,6 +646,7 @@ class JournalWindow:
 
         details = self.Gtk.Expander(label="Session details and provenance summary")
         details.set_child(self._details_grid(session))
+        self.details_expander = details
         self.content_box.append(details)
         if detail.extraction_errors:
             errors = self.Gtk.Expander(
@@ -459,6 +690,7 @@ class JournalWindow:
         message = self.Gtk.Label(
             label=presented.entry.text, xalign=0, wrap=True, selectable=True
         )
+        message.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         body.append(message)
         labels = (*presented.tags, *presented.indicators)
         if labels:
@@ -471,7 +703,14 @@ class JournalWindow:
         heading.append(body)
         row.set_label_widget(heading)
         row.set_child(self._provenance_grid(session, presented))
+        row.connect("notify::expanded", self._on_entry_expanded, presented.entry.index)
         return row
+
+    def _on_entry_expanded(
+        self, row: object, _pspec: object, entry_index: int
+    ) -> None:
+        if row.get_expanded():
+            self.current_entry_index = entry_index
 
     def _provenance_grid(self, session: CatalogSession, presented: PresentedEntry) -> object:
         entry = presented.entry
@@ -523,6 +762,7 @@ class JournalWindow:
             key = self.Gtk.Label(label=label, xalign=1, yalign=0)
             key.add_css_class("dim-label")
             content = self.Gtk.Label(label=value, xalign=0, wrap=True, selectable=True)
+            content.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
             content.set_hexpand(True)
             grid.attach(key, 0, index, 1, 1)
             grid.attach(content, 1, index, 1, 1)

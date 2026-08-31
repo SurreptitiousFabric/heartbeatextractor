@@ -8,5 +8,6 @@ state/*.sqlite3
 state/*.sqlite3-*
 state/*.db
 state/*.db-*
+state/viewer-state.json
 *.tmp
 .*.tmp
