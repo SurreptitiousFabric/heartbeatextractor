@@ -27,6 +27,16 @@ from .viewer_catalog import (
     SearchHit,
 )
 from .viewer_compare import ComparisonReport, compare_details, filter_timeline
+from .viewer_export import (
+    ExportDocument,
+    activity_document,
+    comparison_document,
+    include_private_notes,
+    render_export,
+    render_preview,
+    selected_entries_document,
+    write_export_atomic,
+)
 from .viewer_model import ALL, SessionBrowserModel, display_start, session_badges
 from .viewer_presenter import PresentedEntry, present_timeline
 from .viewer_tags import TAGS
@@ -80,6 +90,8 @@ class JournalWindow:
         self._comparison_report: ComparisonReport | None = None
         self._activity_report: ActivityReport | None = None
         self._activity_running = False
+        self._export_document: ExportDocument | None = None
+        self._pending_export: tuple[Path, bytes] | None = None
         self._session_rows: dict[object, str] = {}
         self._filter_widgets: dict[str, object] = {}
         self._hits_by_session: dict[str, SearchHit] = {}
@@ -159,6 +171,7 @@ class JournalWindow:
             ),
             ("compare", lambda *_args: self._compare_recent(), ("<Ctrl><Shift>c",)),
             ("activity", lambda *_args: self._open_activity(), ("<Ctrl><Shift>a",)),
+            ("export", lambda *_args: self._open_export_preview(), ("<Ctrl>e",)),
             ("toggle-details", lambda *_args: self._toggle_details(), ("<Ctrl>d",)),
             ("help", lambda *_args: self._show_shortcuts(), ("<Ctrl><Shift>slash",)),
             ("cycle-theme", lambda *_args: self._cycle_theme(), ("<Ctrl><Shift>t",)),
@@ -264,6 +277,7 @@ class JournalWindow:
             ("Cycle system/light/dark theme", "<Ctrl><Shift>t"),
             ("Compare two most recently viewed sessions", "<Ctrl><Shift>c"),
             ("Open daily, weekly, and project activity", "<Ctrl><Shift>a"),
+            ("Preview and export reviewed material", "<Ctrl>e"),
             ("Show this help", "<Ctrl><Shift>slash"),
         ):
             group.add_shortcut(
@@ -442,6 +456,13 @@ class JournalWindow:
         self._accessible(self.activity_button, "Open journal activity calendar")
         self.activity_button.connect("clicked", lambda *_args: self._open_activity())
         header.pack_end(self.activity_button)
+        self.export_button = self.Gtk.Button(
+            icon_name="document-save-as-symbolic",
+            tooltip_text="Preview and export reviewed material",
+        )
+        self._accessible(self.export_button, "Preview and export reviewed material")
+        self.export_button.connect("clicked", lambda *_args: self._open_export_preview())
+        header.pack_end(self.export_button)
         toolbar.add_top_bar(header)
 
         self.main_stack = self.Gtk.Stack()
@@ -1192,6 +1213,189 @@ class JournalWindow:
         self._populate_sessions()
         if self.split.get_collapsed():
             self.split.set_show_content(False)
+
+    def _available_export_scopes(self) -> tuple[str, ...]:
+        scopes: list[str] = []
+        if self.current_detail is not None and self.current_detail.entries:
+            scopes.append("Current entry")
+        if self.current_detail is not None and self._selected_entry_indexes:
+            scopes.extend(("Checked entries", "Checked time range"))
+        if self._comparison_report is not None:
+            scopes.append("Comparison results")
+        if self._activity_report is not None:
+            scopes.append("Activity view")
+        return tuple(scopes)
+
+    def _open_export_preview(self) -> None:
+        scopes = self._available_export_scopes()
+        if not scopes:
+            self._set_action_status(
+                "Select timeline entries, build a comparison, or open activity before export.",
+                warning=True,
+            )
+            return
+        dialog = self.Adw.Dialog()
+        dialog.set_title("Review export")
+        toolbar = self.Adw.ToolbarView()
+        header = self.Adw.HeaderBar()
+        cancel = self.Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_args: dialog.close())
+        header.pack_start(cancel)
+        choose = self.Gtk.Button(label="Choose destination…")
+        choose.add_css_class("suggested-action")
+        choose.connect("clicked", lambda *_args: self._choose_export_destination(dialog))
+        header.pack_end(choose)
+        toolbar.add_top_bar(header)
+        content = self.Gtk.Box(
+            orientation=self.Gtk.Orientation.VERTICAL,
+            spacing=10,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        controls = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=8)
+        controls.append(self.Gtk.Label(label="Scope"))
+        self.export_scope = self.Gtk.DropDown.new_from_strings(list(scopes))
+        self.export_scope.connect("notify::selected", self._update_export_preview)
+        controls.append(self.export_scope)
+        controls.append(self.Gtk.Label(label="Format"))
+        self.export_format = self.Gtk.DropDown.new_from_strings(["Markdown", "JSON"])
+        self.export_format.connect("notify::selected", self._update_export_preview)
+        controls.append(self.export_format)
+        self.export_notes = self.Gtk.CheckButton(
+            label="Include private notes (explicit opt-in)"
+        )
+        self.export_notes.connect("toggled", self._update_export_preview)
+        controls.append(self.export_notes)
+        content.append(controls)
+        warning = self.Gtk.Label(
+            label=(
+                "Generated journals may still contain private project information. "
+                "Review every item below before export."
+            ),
+            xalign=0,
+            wrap=True,
+        )
+        warning.add_css_class("warning")
+        content.append(warning)
+        self.export_preview = self.Gtk.TextView(
+            editable=False,
+            cursor_visible=False,
+            monospace=True,
+            wrap_mode=self.Gtk.WrapMode.WORD_CHAR,
+        )
+        preview_scroll = self.Gtk.ScrolledWindow(vexpand=True, min_content_height=420)
+        preview_scroll.set_child(self.export_preview)
+        content.append(preview_scroll)
+        toolbar.set_content(content)
+        dialog.set_child(toolbar)
+        self._update_export_preview()
+        dialog.present(self.window)
+
+    def _build_export_document(self) -> ExportDocument:
+        scope = self._selected_text(self.export_scope)
+        if scope == "Current entry":
+            document = selected_entries_document(
+                self.current_detail, {self.current_entry_index}
+            )
+        elif scope == "Checked entries":
+            document = selected_entries_document(
+                self.current_detail, set(self._selected_entry_indexes)
+            )
+        elif scope == "Checked time range":
+            document = selected_entries_document(
+                self.current_detail,
+                set(self._selected_entry_indexes),
+                inclusive_range=True,
+            )
+        elif scope == "Comparison results" and self._comparison_report is not None:
+            document = comparison_document(self._comparison_report)
+        elif scope == "Activity view" and self._activity_report is not None:
+            session_ids = sorted(
+                {
+                    session_id
+                    for bucket in self._activity_report.days
+                    for session_id in bucket.session_ids
+                }
+            )
+            details = tuple(self.catalog.load_detail(session_id, cache=False) for session_id in session_ids)
+            document = activity_document(self._activity_report, details)
+        else:
+            raise ValueError("The selected export scope is no longer available.")
+        return (
+            include_private_notes(document, self.annotations)
+            if self.export_notes.get_active()
+            else document
+        )
+
+    def _update_export_preview(self, *_args: object) -> None:
+        try:
+            self._export_document = self._build_export_document()
+            preview = render_preview(self._export_document)
+        except (CatalogError, ValueError) as exc:
+            self._export_document = None
+            preview = f"Export unavailable: {exc}"
+        self.export_preview.get_buffer().set_text(preview)
+
+    def _choose_export_destination(self, preview_dialog: object) -> None:
+        self._update_export_preview()
+        if self._export_document is None:
+            return
+        format_name = self._selected_text(self.export_format) or "Markdown"
+        self._export_format_name = format_name.lower()
+        extension = ".md" if format_name == "Markdown" else ".json"
+        file_dialog = self.Gtk.FileDialog(title="Choose reviewed export destination")
+        file_dialog.set_initial_name(f"heartbeat-export{extension}")
+        file_dialog.save(self.window, None, self._export_destination_chosen)
+        preview_dialog.close()
+
+    def _export_destination_chosen(self, dialog: object, result: object) -> None:
+        try:
+            selected = dialog.save_finish(result)
+            path_value = selected.get_path()
+            if not path_value:
+                raise ValueError("Only a local export destination is supported.")
+            destination = Path(path_value)
+            content = render_export(self._export_document, self._export_format_name)
+        except Exception:
+            return
+        if destination.exists():
+            self._pending_export = (destination, content)
+            confirmation = self.Adw.AlertDialog.new(
+                "Replace existing export?",
+                "The chosen local file already exists. Replacement will be atomic.",
+            )
+            confirmation.add_response("cancel", "Cancel")
+            confirmation.add_response("replace", "Replace")
+            confirmation.set_response_appearance(
+                "replace", self.Adw.ResponseAppearance.DESTRUCTIVE
+            )
+            confirmation.set_default_response("cancel")
+            confirmation.set_close_response("cancel")
+            confirmation.choose(self.window, None, self._export_overwrite_chosen)
+            return
+        self._write_export(destination, content, overwrite=False)
+
+    def _export_overwrite_chosen(self, dialog: object, result: object) -> None:
+        try:
+            response = dialog.choose_finish(result)
+        except Exception:
+            response = "cancel"
+        pending = self._pending_export
+        self._pending_export = None
+        if response == "replace" and pending is not None:
+            self._write_export(*pending, overwrite=True)
+
+    def _write_export(self, destination: Path, content: bytes, *, overwrite: bool) -> None:
+        try:
+            write_export_atomic(destination, content, overwrite=overwrite)
+        except (OSError, ValueError):
+            self.sync_status.set_label("Export failed safely; no partial target was retained.")
+            return
+        self.sync_status.set_label(
+            f"Exported {len(content)} reviewed byte(s) to the chosen local destination."
+        )
 
     def _timeline_row(self, session: CatalogSession, presented: PresentedEntry) -> object:
         row = self.Gtk.Expander()
