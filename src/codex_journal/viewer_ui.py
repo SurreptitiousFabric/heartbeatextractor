@@ -25,6 +25,7 @@ from .viewer_catalog import (
     SearchFilters,
     SearchHit,
 )
+from .viewer_compare import ComparisonReport, compare_details, filter_timeline
 from .viewer_model import ALL, SessionBrowserModel, display_start, session_badges
 from .viewer_presenter import PresentedEntry, present_timeline
 from .viewer_tags import TAGS
@@ -74,6 +75,8 @@ class JournalWindow:
         self._selected_entry_indexes: set[int] = set()
         self.action_status: object | None = None
         self._pending_note_delete: AnnotationTarget | None = None
+        self._recent_session_ids: list[str] = []
+        self._comparison_report: ComparisonReport | None = None
         self._session_rows: dict[object, str] = {}
         self._filter_widgets: dict[str, object] = {}
         self._hits_by_session: dict[str, SearchHit] = {}
@@ -151,6 +154,7 @@ class JournalWindow:
                 lambda *_args: self._toggle_session_bookmark(),
                 ("<Ctrl><Shift>b",),
             ),
+            ("compare", lambda *_args: self._compare_recent(), ("<Ctrl><Shift>c",)),
             ("toggle-details", lambda *_args: self._toggle_details(), ("<Ctrl>d",)),
             ("help", lambda *_args: self._show_shortcuts(), ("<Ctrl><Shift>slash",)),
             ("cycle-theme", lambda *_args: self._cycle_theme(), ("<Ctrl><Shift>t",)),
@@ -158,11 +162,6 @@ class JournalWindow:
         for name, callback, accelerators in actions:
             action = self.Gio.SimpleAction.new(name, None)
             action.connect("activate", callback)
-            self.window.add_action(action)
-            self.application.set_accels_for_action(f"win.{name}", list(accelerators))
-        for name, accelerators in (("compare", ("<Ctrl><Shift>c",)),):
-            action = self.Gio.SimpleAction.new(name, None)
-            action.set_enabled(False)
             self.window.add_action(action)
             self.application.set_accels_for_action(f"win.{name}", list(accelerators))
 
@@ -259,7 +258,7 @@ class JournalWindow:
             ("Bookmark current session", "<Ctrl><Shift>b"),
             ("Toggle session details", "<Ctrl>d"),
             ("Cycle system/light/dark theme", "<Ctrl><Shift>t"),
-            ("Compare sessions (available in comparison view)", "<Ctrl><Shift>c"),
+            ("Compare two most recently viewed sessions", "<Ctrl><Shift>c"),
             ("Show this help", "<Ctrl><Shift>slash"),
         ):
             group.add_shortcut(
@@ -424,6 +423,13 @@ class JournalWindow:
             "clicked", lambda *_args: self._toggle_session_bookmark()
         )
         header.pack_end(self.bookmark_session_button)
+        self.compare_button = self.Gtk.Button(
+            icon_name="view-grid-symbolic",
+            tooltip_text="Compare two most recently viewed sessions",
+        )
+        self._accessible(self.compare_button, "Compare two most recently viewed sessions")
+        self.compare_button.connect("clicked", lambda *_args: self._compare_recent())
+        header.pack_end(self.compare_button)
         toolbar.add_top_bar(header)
 
         self.main_stack = self.Gtk.Stack()
@@ -790,6 +796,10 @@ class JournalWindow:
         if session_id != self.model.selected_session_id:
             self.current_entry_index = 0
         self.model.select(session_id)
+        if session_id in self._recent_session_ids:
+            self._recent_session_ids.remove(session_id)
+        self._recent_session_ids.append(session_id)
+        self._recent_session_ids = self._recent_session_ids[-10:]
         self._selected_entry_indexes.clear()
         self._render_session(session_id)
         if self.split.get_collapsed():
@@ -896,6 +906,110 @@ class JournalWindow:
             errors.set_child(error_box)
             self.content_box.append(errors)
         self._show_state("content")
+
+    def _compare_recent(self) -> None:
+        if len(self._recent_session_ids) < 2:
+            self._set_action_status(
+                "View two different sessions before opening comparison.", warning=True
+            )
+            return
+        left_id, right_id = self._recent_session_ids[-2:]
+        if left_id == right_id:
+            self._set_action_status("Comparison requires two different sessions.", warning=True)
+            return
+        try:
+            report = compare_details(
+                self.catalog.load_detail(left_id), self.catalog.load_detail(right_id)
+            )
+        except CatalogError:
+            self._set_action_status("One generated session failed comparison validation.", warning=True)
+            return
+        self._comparison_report = report
+        self.current_detail = None
+        self._clear_box(self.content_box)
+        title = self.Gtk.Label(label="Session comparison", xalign=0)
+        title.add_css_class("title-1")
+        self.content_box.append(title)
+        explanation = self.Gtk.Label(
+            label=(
+                "Exact normalized text only · unchanged rows match exactly · "
+                "left-only and right-only rows do not imply causality."
+            ),
+            xalign=0,
+            wrap=True,
+        )
+        explanation.add_css_class("dim-label")
+        self.content_box.append(explanation)
+        self.content_box.append(self._comparison_metadata(report))
+        filter_row = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=8)
+        filter_row.append(self.Gtk.Label(label="Timeline tag", xalign=0))
+        self.comparison_tag = self.Gtk.DropDown.new_from_strings([ALL, *TAGS])
+        self.comparison_tag.connect("notify::selected", self._on_comparison_filter)
+        filter_row.append(self.comparison_tag)
+        self.content_box.append(filter_row)
+        self.comparison_timeline = self.Gtk.Box(
+            orientation=self.Gtk.Orientation.VERTICAL, spacing=8
+        )
+        self.content_box.append(self.comparison_timeline)
+        self._render_comparison_timeline(None)
+        self._show_state("content")
+
+    def _comparison_metadata(self, report: ComparisonReport) -> object:
+        grid = self.Gtk.Grid(column_spacing=12, row_spacing=7)
+        for column, label in enumerate(("Field", "Earlier viewed", "Later viewed")):
+            heading = self.Gtk.Label(label=label, xalign=0)
+            heading.add_css_class("heading")
+            grid.attach(heading, column, 0, 1, 1)
+        for row_index, item in enumerate(report.metadata, 1):
+            for column, value in enumerate((item.label, item.left, item.right)):
+                label = self.Gtk.Label(label=value, xalign=0, wrap=True, selectable=True)
+                label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                label.set_hexpand(column > 0)
+                if column == 0:
+                    label.add_css_class("dim-label")
+                grid.attach(label, column, row_index, 1, 1)
+        return grid
+
+    def _on_comparison_filter(self, dropdown: object, _pspec: object) -> None:
+        self._render_comparison_timeline(self._selected_text(dropdown))
+
+    def _render_comparison_timeline(self, tag: str | None) -> None:
+        report = self._comparison_report
+        if report is None or not hasattr(self, "comparison_timeline"):
+            return
+        self._clear_box(self.comparison_timeline)
+        rows = filter_timeline(report.timeline, None if tag in (None, ALL) else tag)
+        if not rows:
+            empty = self.Gtk.Label(
+                label="No timeline entries match this deterministic filter.", xalign=0
+            )
+            empty.add_css_class("dim-label")
+            self.comparison_timeline.append(empty)
+            return
+        for row in rows:
+            grid = self.Gtk.Grid(column_spacing=12, row_spacing=4)
+            grid.add_css_class("card")
+            kind = self.Gtk.Label(label=row.kind, xalign=0)
+            kind.add_css_class("caption")
+            grid.attach(kind, 0, 0, 2, 1)
+            grid.attach(self._comparison_entry(row.left, "Left"), 0, 1, 1, 1)
+            grid.attach(self._comparison_entry(row.right, "Right"), 1, 1, 1, 1)
+            self.comparison_timeline.append(grid)
+
+    def _comparison_entry(self, entry: object | None, side: str) -> object:
+        if entry is None:
+            label = self.Gtk.Label(label=f"{side}: —", xalign=0)
+            label.add_css_class("dim-label")
+            return label
+        label = self.Gtk.Label(
+            label=f"{entry.display_time}  {entry.text}",
+            xalign=0,
+            wrap=True,
+            selectable=True,
+        )
+        label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        label.set_hexpand(True)
+        return label
 
     def _timeline_row(self, session: CatalogSession, presented: PresentedEntry) -> object:
         row = self.Gtk.Expander()
