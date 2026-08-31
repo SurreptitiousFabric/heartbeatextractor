@@ -413,7 +413,7 @@ class ViewerFoundationTests(unittest.TestCase):
 
         modules = load_gtk(available)
         self.assertEqual(requested, [("Gtk", "4.0"), ("Adw", "1")])
-        self.assertEqual(len(modules), 3)
+        self.assertEqual(len(modules), 4)
 
 
 if __name__ == "__main__":
