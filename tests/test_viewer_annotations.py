@@ -66,6 +66,21 @@ class ViewerAnnotationTests(unittest.TestCase):
         ]
         self.assertEqual(files_with_sentinel, [self.root / "state" / "annotations.db"])
 
+    def test_invalid_targets_fail_closed(self) -> None:
+        for target in (AnnotationTarget(""), AnnotationTarget("x" * 257), AnnotationTarget("ok", -2)):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "invalid"):
+                self.store.toggle_bookmark(target)
+
+    def test_corrupt_and_symlinked_annotation_state_fail_closed(self) -> None:
+        corrupt = self.root / "corrupt.db"
+        corrupt.write_bytes(b"not a sqlite database")
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            AnnotationStore(corrupt)
+        link = self.root / "link.db"
+        link.symlink_to(self.store.path)
+        with self.assertRaisesRegex(ValueError, "symbolic-link"):
+            AnnotationStore(link)
+
 
 if __name__ == "__main__":
     unittest.main()

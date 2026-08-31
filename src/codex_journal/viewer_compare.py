@@ -8,6 +8,9 @@ from .viewer_catalog import CatalogDetail, CatalogEntry, CatalogSession
 from .viewer_tags import classify_entry
 
 
+MAX_COMPARISON_ENTRIES = 10_000
+
+
 @dataclass(frozen=True)
 class MetadataComparison:
     label: str
@@ -33,6 +36,8 @@ class ComparisonReport:
 
 
 def compare_details(left: CatalogDetail, right: CatalogDetail) -> ComparisonReport:
+    if len(left.entries) > MAX_COMPARISON_ENTRIES or len(right.entries) > MAX_COMPARISON_ENTRIES:
+        raise ValueError("Comparison exceeds the 10,000-entry per-session safety limit.")
     timeline = _compare_timeline(left.entries, right.entries)
     tags = tuple(sorted({tag for row in timeline for tag in row.tags}, key=str.casefold))
     metadata = (

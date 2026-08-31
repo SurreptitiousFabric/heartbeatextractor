@@ -39,10 +39,13 @@ class AnnotationStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self.connection = sqlite3.connect(path)
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        with self.connection:
-            self.connection.executescript(
+        if path.is_symlink():
+            raise ValueError("refusing symbolic-link annotation state")
+        try:
+            self.connection = sqlite3.connect(path)
+            self.connection.execute("PRAGMA foreign_keys = ON")
+            with self.connection:
+                self.connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS bookmarks (
                     session_id TEXT NOT NULL,
@@ -62,7 +65,11 @@ class AnnotationStore:
                     preference_value TEXT NOT NULL
                 );
                 """
-            )
+                )
+        except sqlite3.Error as exc:
+            if hasattr(self, "connection"):
+                self.connection.close()
+            raise ValueError("private annotation database is malformed") from exc
 
     def close(self) -> None:
         self.connection.close()
@@ -74,6 +81,7 @@ class AnnotationStore:
         self.close()
 
     def is_bookmarked(self, target: AnnotationTarget) -> bool:
+        _validate_target(target)
         row = self.connection.execute(
             "SELECT 1 FROM bookmarks WHERE session_id = ? AND event_sequence = ?",
             (target.session_id, target.event_sequence),
@@ -81,6 +89,7 @@ class AnnotationStore:
         return row is not None
 
     def set_bookmarked(self, target: AnnotationTarget, bookmarked: bool) -> bool:
+        _validate_target(target)
         with self.connection:
             if bookmarked:
                 self.connection.execute(
@@ -110,6 +119,7 @@ class AnnotationStore:
         return frozenset(row[0] for row in self.connection.execute("SELECT DISTINCT session_id FROM bookmarks"))
 
     def get_note(self, target: AnnotationTarget) -> PrivateNote | None:
+        _validate_target(target)
         row = self.connection.execute(
             "SELECT note_text, updated_at_utc FROM private_notes "
             "WHERE session_id = ? AND event_sequence = ?",
@@ -118,6 +128,7 @@ class AnnotationStore:
         return PrivateNote(target, row[0], row[1]) if row else None
 
     def save_note(self, target: AnnotationTarget, text: str) -> PrivateNote:
+        _validate_target(target)
         normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
         if not normalized:
             raise ValueError("A private note cannot be empty.")
@@ -134,6 +145,7 @@ class AnnotationStore:
         return PrivateNote(target, normalized, updated)
 
     def delete_note(self, target: AnnotationTarget) -> bool:
+        _validate_target(target)
         with self.connection:
             cursor = self.connection.execute(
                 "DELETE FROM private_notes WHERE session_id = ? AND event_sequence = ?",
@@ -171,3 +183,12 @@ class AnnotationStore:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _validate_target(target: AnnotationTarget) -> None:
+    if (
+        not target.session_id
+        or len(target.session_id.encode("utf-8")) > 256
+        or target.event_sequence < -1
+    ):
+        raise ValueError("invalid private annotation target")

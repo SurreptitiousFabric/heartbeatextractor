@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_journal.viewer_state import ViewerState, ViewerStateStore
+from codex_journal.viewer_state import MAX_VIEWER_STATE_BYTES
 
 
 class ViewerStateTests(unittest.TestCase):
@@ -65,6 +66,18 @@ class ViewerStateTests(unittest.TestCase):
             self.store.save(ViewerState())
         replace.assert_called_once()
         self.assertEqual(replace.call_args.args[1], self.path)
+
+    def test_oversized_and_symlinked_state_fail_closed(self) -> None:
+        self.path.parent.mkdir()
+        self.path.write_bytes(b"x" * (MAX_VIEWER_STATE_BYTES + 1))
+        self.assertEqual(self.store.load(), ViewerState())
+        self.path.unlink()
+        outside = Path(self.temp.name) / "outside.json"
+        outside.write_text('{"format_version": 1, "selected_session_id": "outside"}', encoding="utf-8")
+        self.path.symlink_to(outside)
+        self.assertEqual(self.store.load(), ViewerState())
+        with self.assertRaisesRegex(ValueError, "symbolic-link"):
+            self.store.save(ViewerState())
 
 
 if __name__ == "__main__":

@@ -528,7 +528,12 @@ class JournalWindow:
             self.model.set_bookmarked_session_ids(self.annotations.bookmarked_session_ids())
             if self.search_index is not None:
                 self.search_index.close()
-            self.search_index = JournalSearchIndex(self.repo_root / "state" / "viewer.sqlite3")
+            search_path = self.repo_root / "state" / "viewer.sqlite3"
+            try:
+                self.search_index = JournalSearchIndex(search_path)
+            except CatalogError:
+                rebuild_search_index_atomic(self.catalog, search_path)
+                self.search_index = JournalSearchIndex(search_path)
             if rebuild_index:
                 self.search_index.rebuild(self.catalog)
             self._populate_filters()
@@ -555,18 +560,26 @@ class JournalWindow:
         return False
 
     def _on_close(self, *_args: object) -> bool:
+        if self._closed:
+            return False
         self._closed = True
         if self._periodic_source is not None:
             self.GLib.source_remove(self._periodic_source)
             self._periodic_source = None
-        self.state_store.save(self._capture_state())
-        self.annotations.set_preference("theme", self.theme)
-        self.annotations.set_preference(
-            "sync_on_launch", "true" if self.sync_on_launch_check.get_active() else "false"
-        )
-        self.annotations.set_preference(
-            "periodic_sync", "true" if self.periodic_sync_check.get_active() else "false"
-        )
+        try:
+            self.state_store.save(self._capture_state())
+        except (OSError, ValueError):
+            pass
+        try:
+            self.annotations.set_preference("theme", self.theme)
+            self.annotations.set_preference(
+                "sync_on_launch", "true" if self.sync_on_launch_check.get_active() else "false"
+            )
+            self.annotations.set_preference(
+                "periodic_sync", "true" if self.periodic_sync_check.get_active() else "false"
+            )
+        except (OSError, ValueError):
+            pass
         self.annotations.close()
         if self.search_index is not None:
             self.search_index.close()
@@ -842,7 +855,7 @@ class JournalWindow:
     def _render_session(self, session_id: str) -> None:
         try:
             detail = self.catalog.load_detail(session_id)
-        except CatalogError:
+        except (CatalogError, ValueError):
             self.error_page.set_title("Generated journal is malformed")
             self.error_page.set_description(
                 "The selected generated artifact failed validation and was not displayed. "
@@ -955,7 +968,7 @@ class JournalWindow:
             report = compare_details(
                 self.catalog.load_detail(left_id), self.catalog.load_detail(right_id)
             )
-        except CatalogError:
+        except (CatalogError, ValueError):
             self._set_action_status("One generated session failed comparison validation.", warning=True)
             return
         self._comparison_report = report

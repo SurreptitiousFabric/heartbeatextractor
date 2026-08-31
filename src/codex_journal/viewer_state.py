@@ -67,9 +67,15 @@ class ViewerStateStore:
         if not self.path.is_file():
             return ViewerState()
         try:
+            if self.path.is_symlink():
+                return ViewerState()
             if self.path.stat().st_size > MAX_VIEWER_STATE_BYTES:
                 return ViewerState()
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            with self.path.open("rb") as handle:
+                raw = handle.read(MAX_VIEWER_STATE_BYTES + 1)
+            if len(raw) > MAX_VIEWER_STATE_BYTES:
+                return ViewerState()
+            payload = json.loads(raw.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return ViewerState()
         if not isinstance(payload, dict) or payload.get("format_version") != 1:
@@ -103,6 +109,8 @@ class ViewerStateStore:
 
     def save(self, state: ViewerState) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.is_symlink():
+            raise ValueError("refusing to replace symbolic-link viewer state")
         payload: dict[str, Any] = {"format_version": 1, **asdict(state)}
         encoded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
         if len(encoded) > MAX_VIEWER_STATE_BYTES:

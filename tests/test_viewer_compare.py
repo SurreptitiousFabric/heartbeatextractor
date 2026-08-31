@@ -80,6 +80,11 @@ class ViewerComparisonTests(unittest.TestCase):
         self.assertEqual(len(report.timeline), 200)
         self.assertTrue(all(row.kind == "right only" for row in report.timeline))
 
+    def test_oversized_comparison_fails_before_sequence_matching(self) -> None:
+        oversized = detail("large", tuple("same" for _ in range(10_001)))
+        with self.assertRaisesRegex(ValueError, "10,000-entry"):
+            compare_details(oversized, detail("small", ("one",)))
+
 
 if __name__ == "__main__":
     unittest.main()

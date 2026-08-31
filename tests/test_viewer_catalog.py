@@ -105,6 +105,24 @@ class ViewerCatalogTests(unittest.TestCase):
             index.rebuild(self.catalog)
             self.assertFalse(index.search(sentinel))
 
+    def test_unknown_search_tag_fails_closed(self) -> None:
+        with JournalSearchIndex(self.repo / "state" / "viewer.sqlite3") as index:
+            index.rebuild(self.catalog)
+            with self.assertRaisesRegex(CatalogError, "unknown deterministic"):
+                index.search("", filters=SearchFilters(tags=("invented",)))
+
+    def test_corrupt_and_symlinked_search_state_fail_closed(self) -> None:
+        corrupt = self.repo / "state" / "corrupt.sqlite3"
+        corrupt.write_bytes(b"not a sqlite database")
+        with self.assertRaisesRegex(CatalogError, "unavailable or malformed"):
+            JournalSearchIndex(corrupt)
+        target = self.repo / "state" / "target.sqlite3"
+        target.touch()
+        link = self.repo / "state" / "link.sqlite3"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(CatalogError, "symbolic-link"):
+            JournalSearchIndex(link)
+
     def test_malformed_generated_artifact_fails_closed(self) -> None:
         malformed = self.repo / "journal" / "bad.md"
         malformed.write_text("---\nsession_id: not-json\n---\nprivate body\n", encoding="utf-8")

@@ -285,6 +285,38 @@ class TimeAndRobustnessTests(JournalTestCase):
         leftovers = list(target.parent.glob(f".{target.name}.*.tmp"))
         self.assertFalse(leftovers)
 
+    def test_15b_verify_accepts_a_valid_synced_prefix_after_live_append(self) -> None:
+        source = self.fixture("active_append.jsonl")
+        self.engine.sync(timezone_name="Europe/Zurich")
+        with source.open("a", encoding="utf-8") as output:
+            output.write(
+                json_line(
+                    commentary(
+                        "This append happened after the fixed sync snapshot.",
+                        "2026-08-31T10:01:00Z",
+                    )
+                )
+            )
+        verification = self.engine.verify()
+        self.assertFalse(verification.errors)
+        self.assertTrue(
+            any("source appended since last sync" in warning for warning in verification.warnings)
+        )
+
+    def test_15c_verify_rejects_changed_or_truncated_synced_prefix(self) -> None:
+        source = self.fixture("active_append.jsonl")
+        self.engine.sync(timezone_name="Europe/Zurich")
+        original = source.read_text(encoding="utf-8")
+        source.write_text(original.replace("Checking", "Tracking"), encoding="utf-8")
+        self.assertTrue(
+            any("source fingerprint mismatch" in error for error in self.engine.verify().errors)
+        )
+
+        source.write_text(original[:-1], encoding="utf-8")
+        self.assertTrue(
+            any("source snapshot unavailable" in error for error in self.engine.verify().errors)
+        )
+
 
 class PrivacyAndIndexTests(JournalTestCase):
     def test_16_secret_redaction_and_environment_dump_omission(self) -> None:

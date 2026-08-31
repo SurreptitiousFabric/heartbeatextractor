@@ -140,6 +140,17 @@ class ViewerExportTests(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_symbolic_link_export_target_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside.md"
+            outside.write_text("keep\n", encoding="utf-8")
+            link = root / "export.md"
+            link.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "symbolic-link"):
+                write_export_atomic(link, b"replace\n", overwrite=True)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
+
 
 if __name__ == "__main__":
     unittest.main()

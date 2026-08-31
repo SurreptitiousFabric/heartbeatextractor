@@ -44,13 +44,32 @@ def run_viewer(repo_root: Path, state_root: Path) -> int:
                 application_id="com.surreptitiousfabric.HeartbeatExtractor",
                 flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
             )
+            self.controller: object | None = None
 
         def do_activate(self) -> None:
             window = self.get_active_window()
             if window is None:
                 from .viewer_ui import JournalWindow
 
-                window = JournalWindow(self, repo_root, state_root, modules).window
+                try:
+                    self.controller = JournalWindow(
+                        self, repo_root, state_root, modules
+                    )
+                    window = self.controller.window
+                except (OSError, ValueError):
+                    window = Adw.ApplicationWindow(application=self)
+                    window.set_title("Heartbeat Extractor")
+                    window.set_default_size(720, 480)
+                    window.set_content(
+                        Adw.StatusPage(
+                            title="Private viewer state is unavailable",
+                            description=(
+                                "A local state database failed closed. Generated journals and "
+                                "source logs were not changed."
+                            ),
+                            icon_name="dialog-warning-symbolic",
+                        )
+                    )
             window.present()
 
     return int(JournalApplication().run([]))

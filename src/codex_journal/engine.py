@@ -222,10 +222,44 @@ class JournalEngine:
             source = source_by_id.get(session_id)
             if source is None:
                 result.errors.append(f"{journal.relative_to(self.repo_root)}: source session not found")
-            else:
-                fingerprint = sha256_file(source.path)
-                if fingerprint != metadata.get("source_fingerprint"):
-                    result.errors.append(f"{journal.relative_to(self.repo_root)}: source fingerprint mismatch")
+            elif cached is not None:
+                relative_journal = journal.relative_to(self.repo_root)
+                recorded_fingerprint = metadata.get("source_fingerprint")
+                if (
+                    not isinstance(recorded_fingerprint, str)
+                    or len(recorded_fingerprint) != 64
+                    or cached.source_fingerprint != recorded_fingerprint
+                ):
+                    result.errors.append(
+                        f"{relative_journal}: source fingerprint disagrees with processing state"
+                    )
+                elif cached.source_key != source.source_key:
+                    result.errors.append(
+                        f"{relative_journal}: source location disagrees with processing state"
+                    )
+                elif not isinstance(cached.source_size, int) or cached.source_size < 0:
+                    result.errors.append(
+                        f"{relative_journal}: invalid source snapshot size in processing state"
+                    )
+                else:
+                    try:
+                        current_size = source.path.stat().st_size
+                        prefix_fingerprint = sha256_file(
+                            source.path, cached.source_size
+                        )
+                    except (OSError, ValueError) as exc:
+                        result.errors.append(
+                            f"{relative_journal}: source snapshot unavailable: {type(exc).__name__}"
+                        )
+                    else:
+                        if prefix_fingerprint != recorded_fingerprint:
+                            result.errors.append(
+                                f"{relative_journal}: source fingerprint mismatch"
+                            )
+                        elif current_size > cached.source_size:
+                            result.warnings.append(
+                                f"{relative_journal}: source appended since last sync"
+                            )
             entry_count = count_timeline_entries(journal)
             result.entries += entry_count
             if entry_count != metadata.get("timeline_entries"):

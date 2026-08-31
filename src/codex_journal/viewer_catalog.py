@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .viewer_tags import classify_entry
+from .viewer_tags import TAGS, classify_entry
 
 
 MAX_METADATA_BYTES = 64 * 1024
@@ -363,8 +363,10 @@ class JournalSearchIndex:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self.connection = sqlite3.connect(path)
+        if path.is_symlink():
+            raise CatalogError("refusing symbolic-link viewer search state")
         try:
+            self.connection = sqlite3.connect(path)
             self.connection.execute(
                 "CREATE TABLE IF NOT EXISTS viewer_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
@@ -396,8 +398,9 @@ class JournalSearchIndex:
                 """
             )
         except sqlite3.Error as exc:
-            self.connection.close()
-            raise CatalogError("SQLite FTS5 is unavailable for viewer search") from exc
+            if hasattr(self, "connection"):
+                self.connection.close()
+            raise CatalogError("viewer search state is unavailable or malformed") from exc
 
     def close(self) -> None:
         self.connection.close()
@@ -453,6 +456,8 @@ class JournalSearchIndex:
     ) -> tuple[SearchHit, ...]:
         cleaned = " ".join(query.split())
         selected = filters or SearchFilters()
+        if any(tag not in TAGS for tag in selected.tags):
+            raise CatalogError("unknown deterministic search tag")
         if not cleaned and selected == SearchFilters():
             return ()
         clauses: list[str] = []
