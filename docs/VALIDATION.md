@@ -60,8 +60,8 @@ that changed prefixes and truncation remain errors.
 A second all-session sync observed two real appends, so that input was correctly
 not labeled unchanged. The idempotence proof then selected one completed source
 without displaying its ID: two exact syncs both reported `unchanged=1`, and
-SHA-256 manifests for all 940 generated journal, provenance, and index files
-were byte-identical.
+SHA-256 manifests for all 938 generated journal, provenance, and index files,
+plus the two tracked directory placeholders, were byte-identical.
 
 These are development-machine observations, not guaranteed benchmarks. The
 architectural bounds—not those timings—are the compatibility contract.
