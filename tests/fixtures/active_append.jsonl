@@ -1,0 +1,3 @@
+{"timestamp":"2026-08-31T10:00:00Z","type":"session_meta","payload":{"id":"22222222-2222-4222-8222-222222222222","session_id":"22222222-2222-4222-8222-222222222222","timestamp":"2026-08-31T10:00:00Z","cwd":"/home/tester/src/active-project","source":"cli"}}
+{"timestamp":"2026-08-31T10:00:01Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-08-31T10:00:10Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Checking the active append-only session."}]}}

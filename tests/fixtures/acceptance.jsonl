@@ -1,0 +1,9 @@
+{"timestamp":"2026-08-31T13:12:00Z","type":"session_meta","payload":{"id":"44444444-4444-4444-8444-444444444444","session_id":"44444444-4444-4444-8444-444444444444","timestamp":"2026-08-31T13:12:00Z","cwd":"/home/tester/src/a-quo","source":"cli","git":{"branch":"main","commit_hash":"def5678","repository_url":"git@github.com:example/a-quo.git"}}}
+{"timestamp":"2026-08-31T13:12:01Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-08-31T13:12:10Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I'm now reviewing #35 hostile profile contract."}]}}
+{"timestamp":"2026-08-31T13:14:00Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I have found two review blockers."}]}}
+{"timestamp":"2026-08-31T13:17:00Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Package-binding test exposed a fixture-permission defect."}]}}
+{"timestamp":"2026-08-31T13:20:00Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Found a fail-open path for unconfirmed NEEDED evidence."}]}}
+{"timestamp":"2026-08-31T13:23:00Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"The agent has corrected the fail-open path."}]}}
+{"timestamp":"2026-08-31T13:31:00Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Three focused offline contracts passed."}]}}
+{"timestamp":"2026-08-31T13:31:01Z","type":"event_msg","payload":{"type":"task_complete"}}
