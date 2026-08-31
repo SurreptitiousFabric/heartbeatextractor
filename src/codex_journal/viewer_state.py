@@ -21,12 +21,20 @@ class ViewerState:
     content_visible: bool = False
     timeline_entry_index: int = 0
     theme: str = "system"
+    sync_on_launch: bool = False
+    periodic_sync: bool = False
+    last_sync_at: str | None = None
+    last_sync_summary: str | None = None
 
 
 def _bounded_dimension(value: object, default: int) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and 480 <= value <= 8192:
         return value
     return default
+
+
+def _strict_bool(value: object) -> bool:
+    return value if isinstance(value, bool) else False
 
 
 def _clean_filters(value: object) -> dict[str, str | bool | None]:
@@ -85,9 +93,23 @@ class ViewerStateStore:
             filters=_clean_filters(payload.get("filters")),
             window_width=_bounded_dimension(payload.get("window_width"), 1180),
             window_height=_bounded_dimension(payload.get("window_height"), 760),
-            content_visible=bool(payload.get("content_visible", False)),
+            content_visible=_strict_bool(payload.get("content_visible", False)),
             timeline_entry_index=entry_index,
             theme=theme,
+            sync_on_launch=_strict_bool(payload.get("sync_on_launch", False)),
+            periodic_sync=_strict_bool(payload.get("periodic_sync", False)),
+            last_sync_at=(
+                payload.get("last_sync_at")
+                if isinstance(payload.get("last_sync_at"), str)
+                and len(payload["last_sync_at"]) <= 128
+                else None
+            ),
+            last_sync_summary=(
+                payload.get("last_sync_summary")
+                if isinstance(payload.get("last_sync_summary"), str)
+                and len(payload["last_sync_summary"]) <= 2048
+                else None
+            ),
         )
 
     def save(self, state: ViewerState) -> None:

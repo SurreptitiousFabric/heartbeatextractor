@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 from gi.repository import Pango
 
+from .engine import JournalEngine
 from .viewer_catalog import (
     CatalogError,
     CatalogSession,
@@ -19,20 +22,35 @@ from .viewer_model import ALL, SessionBrowserModel, display_start, session_badge
 from .viewer_presenter import PresentedEntry, present_timeline
 from .viewer_tags import TAGS
 from .viewer_state import ViewerState, ViewerStateStore
+from .viewer_sync import (
+    CatalogSnapshot,
+    ChangeSummary,
+    compare_snapshots,
+    rebuild_search_index_atomic,
+)
 
 
 class JournalWindow:
     """Native, adaptive browser over generated journal artifacts only."""
 
-    def __init__(self, application: object, repo_root: Path, modules: tuple[Any, ...]) -> None:
+    def __init__(
+        self,
+        application: object,
+        repo_root: Path,
+        state_root: Path,
+        modules: tuple[Any, ...],
+    ) -> None:
         self.Adw, self.Gio, self.GLib, self.Gtk = modules
         self.repo_root = repo_root
+        self.state_root = state_root
         self.application = application
         self.catalog = JournalCatalog(repo_root)
         self.model = SessionBrowserModel(self.catalog)
         self.state_store = ViewerStateStore(repo_root / "state" / "viewer-state.json")
         self.saved_state = self.state_store.load()
         self.theme = self.saved_state.theme
+        self.last_sync_at = self.saved_state.last_sync_at
+        self.last_sync_summary = self.saved_state.last_sync_summary
         self.current_entry_index = self.saved_state.timeline_entry_index
         self._state_restored = False
         self._timeline_widgets: dict[int, object] = {}
@@ -42,6 +60,10 @@ class JournalWindow:
         self._hits_by_session: dict[str, SearchHit] = {}
         self.search_index: JournalSearchIndex | None = None
         self._loading = False
+        self._sync_running = False
+        self._closed = False
+        self._periodic_source: int | None = None
+        self._launch_sync_started = False
 
         self.window = self.Adw.ApplicationWindow(application=application)
         self.window.set_title("Heartbeat Extractor")
@@ -96,6 +118,7 @@ class JournalWindow:
             ("next-entry", lambda *_args: self._move_entry(1), ("<Alt>Down",)),
             ("focus-search", lambda *_args: self.search_entry.grab_focus(), ("<Ctrl>f", "slash")),
             ("refresh", lambda *_args: self.refresh_catalog(), ("F5",)),
+            ("sync", lambda *_args: self._start_sync(), ("<Ctrl>r",)),
             ("toggle-details", lambda *_args: self._toggle_details(), ("<Ctrl>d",)),
             ("help", lambda *_args: self._show_shortcuts(), ("<Ctrl><Shift>slash",)),
             ("cycle-theme", lambda *_args: self._cycle_theme(), ("<Ctrl><Shift>t",)),
@@ -199,6 +222,7 @@ class JournalWindow:
             ("Next entry (J also works)", "<Alt>Down"),
             ("Focus search (/ also works)", "<Ctrl>f"),
             ("Refresh generated journals", "F5"),
+            ("Sync source sessions", "<Ctrl>r"),
             ("Toggle session details", "<Ctrl>d"),
             ("Cycle system/light/dark theme", "<Ctrl><Shift>t"),
             ("Compare sessions (available in comparison view)", "<Ctrl><Shift>c"),
@@ -231,6 +255,12 @@ class JournalWindow:
         self._accessible(theme_button, "Cycle color theme")
         theme_button.connect("clicked", lambda *_args: self._cycle_theme())
         header.pack_end(theme_button)
+        self.sync_button = self.Gtk.Button(
+            icon_name="view-refresh-symbolic", tooltip_text="Sync source sessions"
+        )
+        self._accessible(self.sync_button, "Sync source sessions")
+        self.sync_button.connect("clicked", lambda *_args: self._start_sync())
+        header.pack_end(self.sync_button)
         toolbar.add_top_bar(header)
 
         outer = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=0)
@@ -279,7 +309,27 @@ class JournalWindow:
             "toggled", self._on_boolean_filter, "extraction_errors_only"
         )
         filters.append(self.errors_check)
+        self.sync_on_launch_check = self.Gtk.CheckButton(label="Sync on launch")
+        self.sync_on_launch_check.connect("toggled", self._on_sync_setting_changed)
+        filters.append(self.sync_on_launch_check)
+        self.periodic_sync_check = self.Gtk.CheckButton(
+            label="Sync every 5 minutes while open"
+        )
+        self.periodic_sync_check.connect("toggled", self._on_sync_setting_changed)
+        filters.append(self.periodic_sync_check)
         outer.append(filters)
+
+        self.sync_status = self.Gtk.Label(
+            label=self._stored_sync_status(),
+            xalign=0,
+            wrap=True,
+            margin_start=12,
+            margin_end=12,
+            margin_bottom=8,
+            selectable=True,
+        )
+        self.sync_status.add_css_class("caption")
+        outer.append(self.sync_status)
 
         self.count_label = self.Gtk.Label(
             label="Loading…", xalign=0, margin_start=12, margin_end=12, margin_bottom=8
@@ -357,7 +407,7 @@ class JournalWindow:
     def _show_state(self, name: str) -> None:
         self.main_stack.set_visible_child_name(name)
 
-    def refresh_catalog(self) -> bool:
+    def refresh_catalog(self, *, rebuild_index: bool = True) -> bool:
         if self._loading:
             return False
         if self._state_restored:
@@ -369,7 +419,8 @@ class JournalWindow:
             if self.search_index is not None:
                 self.search_index.close()
             self.search_index = JournalSearchIndex(self.repo_root / "state" / "viewer.sqlite3")
-            self.search_index.rebuild(self.catalog)
+            if rebuild_index:
+                self.search_index.rebuild(self.catalog)
             self._populate_filters()
             self._restore_state()
             self._state_restored = True
@@ -384,11 +435,20 @@ class JournalWindow:
                 first = self.session_list.get_row_at_index(0)
                 if first is not None:
                     self.session_list.select_row(first)
+            if not self._launch_sync_started:
+                self._launch_sync_started = True
+                self._configure_periodic()
+                if self.sync_on_launch_check.get_active():
+                    self.GLib.idle_add(self._start_sync)
         finally:
             self._loading = False
         return False
 
     def _on_close(self, *_args: object) -> bool:
+        self._closed = True
+        if self._periodic_source is not None:
+            self.GLib.source_remove(self._periodic_source)
+            self._periodic_source = None
         self.state_store.save(self._capture_state())
         if self.search_index is not None:
             self.search_index.close()
@@ -409,6 +469,10 @@ class JournalWindow:
             content_visible=self.split.get_show_content(),
             timeline_entry_index=self.current_entry_index,
             theme=self.theme,
+            sync_on_launch=self.sync_on_launch_check.get_active(),
+            periodic_sync=self.periodic_sync_check.get_active(),
+            last_sync_at=self.last_sync_at,
+            last_sync_summary=self.last_sync_summary,
         )
 
     def _accessible(self, widget: object, label: str) -> None:
@@ -429,6 +493,8 @@ class JournalWindow:
         if session_id and any(item.session_id == session_id for item in self.model.sessions):
             self.model.select(session_id)
         self.split.set_show_content(self.saved_state.content_visible)
+        self.sync_on_launch_check.set_active(self.saved_state.sync_on_launch)
+        self.periodic_sync_check.set_active(self.saved_state.periodic_sync)
 
     def _select_dropdown_value(self, dropdown: object, value: str) -> None:
         model = dropdown.get_model()
@@ -480,6 +546,76 @@ class JournalWindow:
             return
         self.model.set_filter(field, bool(button.get_active()))
         self._populate_sessions()
+
+    def _stored_sync_status(self) -> str:
+        if not self.last_sync_at:
+            return "Not synced by the viewer yet."
+        return f"Last successful sync: {self.last_sync_at}\n{self.last_sync_summary or ''}".strip()
+
+    def _on_sync_setting_changed(self, _button: object) -> None:
+        if not self._loading and self._launch_sync_started:
+            self._configure_periodic()
+
+    def _configure_periodic(self) -> None:
+        if self._periodic_source is not None:
+            self.GLib.source_remove(self._periodic_source)
+            self._periodic_source = None
+        if self.periodic_sync_check.get_active() and not self._closed:
+            self._periodic_source = self.GLib.timeout_add_seconds(300, self._periodic_tick)
+
+    def _periodic_tick(self) -> bool:
+        if self._closed or not self.periodic_sync_check.get_active():
+            self._periodic_source = None
+            return False
+        self._start_sync()
+        return True
+
+    def _start_sync(self) -> bool:
+        if self._closed or self._sync_running:
+            return False
+        self._sync_running = True
+        self.sync_button.set_sensitive(False)
+        self.sync_status.set_label("Sync running… generated journals remain usable.")
+        before = CatalogSnapshot.from_catalog(self.catalog)
+        Thread(target=self._sync_worker, args=(before,), daemon=True).start()
+        return False
+
+    def _sync_worker(self, before: CatalogSnapshot) -> None:
+        try:
+            result = JournalEngine(self.repo_root, self.state_root).sync()
+            refreshed = JournalCatalog(self.repo_root)
+            refreshed.refresh()
+            summary = compare_snapshots(before, CatalogSnapshot.from_catalog(refreshed))
+            rebuild_search_index_atomic(refreshed, self.repo_root / "state" / "viewer.sqlite3")
+            self.GLib.idle_add(self._finish_sync, result, summary, None)
+        except Exception as exc:  # worker boundary: report type only, never a private path
+            self.GLib.idle_add(self._finish_sync, None, None, type(exc).__name__)
+
+    def _finish_sync(
+        self,
+        result: object | None,
+        summary: ChangeSummary | None,
+        failure: str | None,
+    ) -> bool:
+        self._sync_running = False
+        if self._closed:
+            return False
+        self.sync_button.set_sensitive(True)
+        if failure or result is None or summary is None:
+            self.sync_status.set_label(f"Sync failed safely ({failure or 'unknown error'}).")
+            return False
+        self.last_sync_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.last_sync_summary = (
+            f"discovered={result.discovered} unchanged={result.unchanged} "
+            f"appended={result.appended} rebuilt={result.rebuilt} "
+            f"no-heartbeats={result.no_heartbeats} "
+            f"active/incomplete={result.active_or_incomplete} "
+            f"sessions-with-errors={result.sessions_with_errors} run-errors={len(result.errors)}. "
+            f"{summary.describe()}"
+        )
+        self.sync_status.set_label(self._stored_sync_status())
+        self.refresh_catalog(rebuild_index=False)
+        return False
 
     def _on_search_changed(self, _entry: object) -> None:
         if self._loading:

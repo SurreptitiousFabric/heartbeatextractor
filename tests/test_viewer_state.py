@@ -47,6 +47,8 @@ class ViewerStateTests(unittest.TestCase):
                 {
                     "format_version": 1,
                     "theme": "remote-theme",
+                    "sync_on_launch": "yes",
+                    "periodic_sync": 1,
                     "filters": {"raw_source": "private", "status": "completed"},
                     "window_width": 1,
                     "timeline_entry_index": -1,
@@ -59,6 +61,8 @@ class ViewerStateTests(unittest.TestCase):
         self.assertEqual(loaded.filters, {"status": "completed"})
         self.assertEqual(loaded.window_width, 1180)
         self.assertEqual(loaded.timeline_entry_index, 0)
+        self.assertFalse(loaded.sync_on_launch)
+        self.assertFalse(loaded.periodic_sync)
 
     def test_save_uses_atomic_replace(self) -> None:
         with patch("codex_journal.viewer_state.os.replace", wraps=__import__("os").replace) as replace:

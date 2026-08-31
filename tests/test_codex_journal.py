@@ -412,7 +412,7 @@ class ViewerFoundationTests(unittest.TestCase):
             return gi if name == "gi" else repository
 
         modules = load_gtk(available)
-        self.assertEqual(requested, [("Gtk", "4.0"), ("Adw", "1")])
+        self.assertEqual(requested, [("Gtk", "4.0"), ("Adw", "1"), ("Pango", "1.0")])
         self.assertEqual(len(modules), 4)
 
 

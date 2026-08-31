@@ -19,6 +19,7 @@ def load_gtk(
         gi = import_module("gi")
         gi.require_version("Gtk", "4.0")
         gi.require_version("Adw", "1")
+        gi.require_version("Pango", "1.0")
         Adw = import_module("gi.repository.Adw")
         Gio = import_module("gi.repository.Gio")
         GLib = import_module("gi.repository.GLib")
@@ -49,7 +50,7 @@ def run_viewer(repo_root: Path, state_root: Path) -> int:
             if window is None:
                 from .viewer_ui import JournalWindow
 
-                window = JournalWindow(self, repo_root, modules).window
+                window = JournalWindow(self, repo_root, state_root, modules).window
             window.present()
 
     return int(JournalApplication().run([]))
