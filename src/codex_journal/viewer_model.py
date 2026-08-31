@@ -19,6 +19,7 @@ class BrowserFilters:
     source_kind: str | None = None
     redacted_only: bool = False
     extraction_errors_only: bool = False
+    bookmarked_only: bool = False
     tag: str | None = None
 
 
@@ -38,6 +39,7 @@ class SessionBrowserModel:
         self.filters = BrowserFilters()
         self.selected_session_id: str | None = None
         self._search_matches: dict[str, int] | None = None
+        self._bookmarked_session_ids: frozenset[str] = frozenset()
 
     @property
     def sessions(self) -> tuple[CatalogSession, ...]:
@@ -53,6 +55,7 @@ class SessionBrowserModel:
             and (filters.source_kind is None or session.source_kind == filters.source_kind)
             and (not filters.redacted_only or session.redaction_count > 0)
             and (not filters.extraction_errors_only or session.extraction_error_count > 0)
+            and (not filters.bookmarked_only or session.session_id in self._bookmarked_session_ids)
             and (self._search_matches is None or session.session_id in self._search_matches)
         )
 
@@ -120,6 +123,13 @@ class SessionBrowserModel:
         for hit in hits:
             matches.setdefault(hit.session_id, hit.entry_index)
         self._search_matches = matches if active else None
+        visible = self.sessions
+        if self.selected_session_id not in {session.session_id for session in visible}:
+            self.selected_session_id = visible[0].session_id if visible else None
+        return visible
+
+    def set_bookmarked_session_ids(self, session_ids: frozenset[str]) -> tuple[CatalogSession, ...]:
+        self._bookmarked_session_ids = session_ids
         visible = self.sessions
         if self.selected_session_id not in {session.session_id for session in visible}:
             self.selected_session_id = visible[0].session_id if visible else None

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from codex_journal.engine import JournalEngine
+from codex_journal.viewer_annotations import AnnotationStore, AnnotationTarget
 from codex_journal.viewer_catalog import (
     CatalogError,
     JournalCatalog,
@@ -95,6 +96,14 @@ class ViewerCatalogTests(unittest.TestCase):
         with JournalSearchIndex(self.repo / "state" / "viewer.sqlite3") as index:
             self.assertGreater(index.rebuild(self.catalog), 0)
         self.assertEqual(self.catalog._details, {})
+
+    def test_private_notes_are_not_indexed(self) -> None:
+        sentinel = "PRIVATE_NOTE_NOT_SEARCHABLE"
+        with AnnotationStore(self.repo / "state" / "annotations.db") as annotations:
+            annotations.save_note(AnnotationTarget(self.catalog.sessions[0].session_id), sentinel)
+        with JournalSearchIndex(self.repo / "state" / "viewer.sqlite3") as index:
+            index.rebuild(self.catalog)
+            self.assertFalse(index.search(sentinel))
 
     def test_malformed_generated_artifact_fails_closed(self) -> None:
         malformed = self.repo / "journal" / "bad.md"

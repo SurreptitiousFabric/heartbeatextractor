@@ -16,6 +16,7 @@ from .viewer_actions import (
     copy_selected_range,
     project_directory_uri,
 )
+from .viewer_annotations import AnnotationStore, AnnotationTarget
 from .viewer_catalog import (
     CatalogError,
     CatalogSession,
@@ -54,7 +55,15 @@ class JournalWindow:
         self.model = SessionBrowserModel(self.catalog)
         self.state_store = ViewerStateStore(repo_root / "state" / "viewer-state.json")
         self.saved_state = self.state_store.load()
-        self.theme = self.saved_state.theme
+        self.annotations = AnnotationStore(repo_root / "state" / "annotations.db")
+        stored_theme = self.annotations.get_preference("theme", "system")
+        self.theme = stored_theme if stored_theme in {"system", "light", "dark"} else "system"
+        self.sync_on_launch_preference = (
+            self.annotations.get_preference("sync_on_launch", "false") == "true"
+        )
+        self.periodic_sync_preference = (
+            self.annotations.get_preference("periodic_sync", "false") == "true"
+        )
         self.last_sync_at = self.saved_state.last_sync_at
         self.last_sync_summary = self.saved_state.last_sync_summary
         self.current_entry_index = self.saved_state.timeline_entry_index
@@ -64,6 +73,7 @@ class JournalWindow:
         self.current_detail: object | None = None
         self._selected_entry_indexes: set[int] = set()
         self.action_status: object | None = None
+        self._pending_note_delete: AnnotationTarget | None = None
         self._session_rows: dict[object, str] = {}
         self._filter_widgets: dict[str, object] = {}
         self._hits_by_session: dict[str, SearchHit] = {}
@@ -135,6 +145,12 @@ class JournalWindow:
                 lambda *_args: self._copy_selected_range(),
                 ("<Ctrl><Alt><Shift>c",),
             ),
+            ("bookmark", lambda *_args: self._toggle_entry_bookmark(), ("<Ctrl>b",)),
+            (
+                "bookmark-session",
+                lambda *_args: self._toggle_session_bookmark(),
+                ("<Ctrl><Shift>b",),
+            ),
             ("toggle-details", lambda *_args: self._toggle_details(), ("<Ctrl>d",)),
             ("help", lambda *_args: self._show_shortcuts(), ("<Ctrl><Shift>slash",)),
             ("cycle-theme", lambda *_args: self._cycle_theme(), ("<Ctrl><Shift>t",)),
@@ -144,10 +160,7 @@ class JournalWindow:
             action.connect("activate", callback)
             self.window.add_action(action)
             self.application.set_accels_for_action(f"win.{name}", list(accelerators))
-        for name, accelerators in (
-            ("compare", ("<Ctrl><Shift>c",)),
-            ("bookmark", ("<Ctrl>b",)),
-        ):
+        for name, accelerators in (("compare", ("<Ctrl><Shift>c",)),):
             action = self.Gio.SimpleAction.new(name, None)
             action.set_enabled(False)
             self.window.add_action(action)
@@ -242,10 +255,11 @@ class JournalWindow:
             ("Open validated project directory", "<Ctrl>o"),
             ("Copy current sanitized entry", "<Ctrl><Alt>c"),
             ("Copy selected sanitized range", "<Ctrl><Alt><Shift>c"),
+            ("Bookmark current entry", "<Ctrl>b"),
+            ("Bookmark current session", "<Ctrl><Shift>b"),
             ("Toggle session details", "<Ctrl>d"),
             ("Cycle system/light/dark theme", "<Ctrl><Shift>t"),
             ("Compare sessions (available in comparison view)", "<Ctrl><Shift>c"),
-            ("Bookmark entry (available with annotations)", "<Ctrl>b"),
             ("Show this help", "<Ctrl><Shift>slash"),
         ):
             group.add_shortcut(
@@ -328,6 +342,9 @@ class JournalWindow:
             "toggled", self._on_boolean_filter, "extraction_errors_only"
         )
         filters.append(self.errors_check)
+        self.bookmarks_check = self.Gtk.CheckButton(label="Bookmarked sessions")
+        self.bookmarks_check.connect("toggled", self._on_boolean_filter, "bookmarked_only")
+        filters.append(self.bookmarks_check)
         self.sync_on_launch_check = self.Gtk.CheckButton(label="Sync on launch")
         self.sync_on_launch_check.connect("toggled", self._on_sync_setting_changed)
         filters.append(self.sync_on_launch_check)
@@ -393,6 +410,20 @@ class JournalWindow:
         self._accessible(self.copy_range_button, "Copy selected sanitized entry range")
         self.copy_range_button.connect("clicked", lambda *_args: self._copy_selected_range())
         header.pack_end(self.copy_range_button)
+        self.bookmark_entry_button = self.Gtk.Button(
+            icon_name="starred-symbolic", tooltip_text="Bookmark or unbookmark current entry"
+        )
+        self._accessible(self.bookmark_entry_button, "Bookmark or unbookmark current entry")
+        self.bookmark_entry_button.connect("clicked", lambda *_args: self._toggle_entry_bookmark())
+        header.pack_end(self.bookmark_entry_button)
+        self.bookmark_session_button = self.Gtk.Button(
+            icon_name="non-starred-symbolic", tooltip_text="Bookmark or unbookmark current session"
+        )
+        self._accessible(self.bookmark_session_button, "Bookmark or unbookmark current session")
+        self.bookmark_session_button.connect(
+            "clicked", lambda *_args: self._toggle_session_bookmark()
+        )
+        header.pack_end(self.bookmark_session_button)
         toolbar.add_top_bar(header)
 
         self.main_stack = self.Gtk.Stack()
@@ -454,6 +485,7 @@ class JournalWindow:
         try:
             self.catalog.refresh()
             self.model = SessionBrowserModel(self.catalog)
+            self.model.set_bookmarked_session_ids(self.annotations.bookmarked_session_ids())
             if self.search_index is not None:
                 self.search_index.close()
             self.search_index = JournalSearchIndex(self.repo_root / "state" / "viewer.sqlite3")
@@ -488,6 +520,14 @@ class JournalWindow:
             self.GLib.source_remove(self._periodic_source)
             self._periodic_source = None
         self.state_store.save(self._capture_state())
+        self.annotations.set_preference("theme", self.theme)
+        self.annotations.set_preference(
+            "sync_on_launch", "true" if self.sync_on_launch_check.get_active() else "false"
+        )
+        self.annotations.set_preference(
+            "periodic_sync", "true" if self.periodic_sync_check.get_active() else "false"
+        )
+        self.annotations.close()
         if self.search_index is not None:
             self.search_index.close()
             self.search_index = None
@@ -506,9 +546,6 @@ class JournalWindow:
             window_height=max(480, self.window.get_height()),
             content_visible=self.split.get_show_content(),
             timeline_entry_index=self.current_entry_index,
-            theme=self.theme,
-            sync_on_launch=self.sync_on_launch_check.get_active(),
-            periodic_sync=self.periodic_sync_check.get_active(),
             last_sync_at=self.last_sync_at,
             last_sync_summary=self.last_sync_summary,
         )
@@ -527,12 +564,15 @@ class JournalWindow:
             elif field == "extraction_errors_only" and isinstance(value, bool):
                 self.errors_check.set_active(value)
                 self.model.set_filter(field, value)
+            elif field == "bookmarked_only" and isinstance(value, bool):
+                self.bookmarks_check.set_active(value)
+                self.model.set_filter(field, value)
         session_id = self.saved_state.selected_session_id
         if session_id and any(item.session_id == session_id for item in self.model.sessions):
             self.model.select(session_id)
         self.split.set_show_content(self.saved_state.content_visible)
-        self.sync_on_launch_check.set_active(self.saved_state.sync_on_launch)
-        self.periodic_sync_check.set_active(self.saved_state.periodic_sync)
+        self.sync_on_launch_check.set_active(self.sync_on_launch_preference)
+        self.periodic_sync_check.set_active(self.periodic_sync_preference)
 
     def _select_dropdown_value(self, dropdown: object, value: str) -> None:
         model = dropdown.get_model()
@@ -729,6 +769,10 @@ class JournalWindow:
         if session.extraction_error_count or session.redaction_count:
             badges.add_css_class("warning")
         box.append(badges)
+        if self.annotations.is_bookmarked(AnnotationTarget(session.session_id)):
+            bookmarked = self.Gtk.Label(label="★ session bookmark", xalign=0)
+            bookmarked.add_css_class("accent")
+            box.append(bookmarked)
         hit = self._hits_by_session.get(session.session_id)
         if hit is not None:
             context = self.Gtk.Label(label=f"Match: {hit.text}", xalign=0, ellipsize=3)
@@ -830,6 +874,7 @@ class JournalWindow:
         relationships = self._relationship_box(session)
         if relationships is not None:
             self.content_box.append(relationships)
+        self.content_box.append(self._notes_expander(detail))
         if detail.extraction_errors:
             errors = self.Gtk.Expander(
                 label=f"Extraction errors ({len(detail.extraction_errors)})"
@@ -878,6 +923,9 @@ class JournalWindow:
         message.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         body.append(message)
         labels = (*presented.tags, *presented.indicators)
+        target = AnnotationTarget(session.session_id, presented.entry.source_event_sequence)
+        if self.annotations.is_bookmarked(target):
+            labels = (*labels, "★ bookmarked")
         if labels:
             tags = self.Gtk.Label(label="  ·  ".join(labels), xalign=0)
             tags.add_css_class("caption")
@@ -947,6 +995,152 @@ class JournalWindow:
             f"Copied {payload.entry_count} sanitized journal entries with timestamps."
         )
 
+    def _current_entry_target(self) -> AnnotationTarget | None:
+        detail = self.current_detail
+        if detail is None:
+            return None
+        entry = next(
+            (item for item in detail.entries if item.index == self.current_entry_index), None
+        )
+        return (
+            AnnotationTarget(detail.session.session_id, entry.source_event_sequence)
+            if entry is not None
+            else None
+        )
+
+    def _toggle_entry_bookmark(self) -> None:
+        target = self._current_entry_target()
+        if target is None:
+            self._set_action_status("No exact timeline entry is available to bookmark.", warning=True)
+            return
+        bookmarked = self.annotations.toggle_bookmark(target)
+        self._after_bookmark_change(
+            "Bookmarked current timeline entry." if bookmarked else "Removed entry bookmark."
+        )
+
+    def _toggle_session_bookmark(self) -> None:
+        session = self.model.selected
+        if session is None:
+            self._set_action_status("No session is available to bookmark.", warning=True)
+            return
+        bookmarked = self.annotations.toggle_bookmark(AnnotationTarget(session.session_id))
+        self._after_bookmark_change(
+            "Bookmarked current session." if bookmarked else "Removed session bookmark."
+        )
+
+    def _after_bookmark_change(self, message: str) -> None:
+        selected = self.model.selected_session_id
+        self.model.set_bookmarked_session_ids(self.annotations.bookmarked_session_ids())
+        self._populate_sessions()
+        if selected and selected in {item.session_id for item in self.model.sessions}:
+            self.model.select(selected)
+        self._set_action_status(message)
+
+    def _notes_expander(self, detail: object) -> object:
+        expander = self.Gtk.Expander(label="Private notes · local annotation database only")
+        outer = self.Gtk.Box(
+            orientation=self.Gtk.Orientation.VERTICAL,
+            spacing=10,
+            margin_top=10,
+            margin_bottom=10,
+            margin_start=10,
+            margin_end=10,
+        )
+        session_target = AnnotationTarget(detail.session.session_id)
+        session_note = self.annotations.get_note(session_target)
+        self.session_note_view = self._note_editor(session_note.text if session_note else "")
+        outer.append(self.Gtk.Label(label="Session note", xalign=0))
+        outer.append(self.session_note_view)
+        outer.append(self._note_buttons("session"))
+
+        self.entry_note_label = self.Gtk.Label(label="Current entry note", xalign=0)
+        outer.append(self.entry_note_label)
+        self.entry_note_view = self._note_editor("")
+        outer.append(self.entry_note_view)
+        outer.append(self._note_buttons("entry"))
+        expander.set_child(outer)
+        self._load_entry_note()
+        return expander
+
+    def _note_editor(self, text: str) -> object:
+        view = self.Gtk.TextView(
+            wrap_mode=self.Gtk.WrapMode.WORD_CHAR,
+            top_margin=8,
+            bottom_margin=8,
+            left_margin=8,
+            right_margin=8,
+            height_request=84,
+        )
+        view.get_buffer().set_text(text)
+        view.add_css_class("card")
+        return view
+
+    def _note_buttons(self, scope: str) -> object:
+        buttons = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=8)
+        save = self.Gtk.Button(label=f"Save {scope} note")
+        save.connect("clicked", lambda _button: self._save_note(scope))
+        delete = self.Gtk.Button(label=f"Delete {scope} note")
+        delete.add_css_class("destructive-action")
+        delete.connect("clicked", lambda button: self._delete_note(scope, button))
+        buttons.append(save)
+        buttons.append(delete)
+        return buttons
+
+    def _note_target(self, scope: str) -> AnnotationTarget | None:
+        session = self.model.selected
+        if session is None:
+            return None
+        return AnnotationTarget(session.session_id) if scope == "session" else self._current_entry_target()
+
+    def _note_view(self, scope: str) -> object:
+        return self.session_note_view if scope == "session" else self.entry_note_view
+
+    def _note_text(self, scope: str) -> str:
+        buffer = self._note_view(scope).get_buffer()
+        start, end = buffer.get_bounds()
+        return buffer.get_text(start, end, True)
+
+    def _save_note(self, scope: str) -> None:
+        target = self._note_target(scope)
+        if target is None:
+            self._set_action_status("No exact annotation target is available.", warning=True)
+            return
+        try:
+            note = self.annotations.save_note(target, self._note_text(scope))
+        except ValueError as exc:
+            self._set_action_status(str(exc), warning=True)
+            return
+        self._note_view(scope).get_buffer().set_text(note.text)
+        self._pending_note_delete = None
+        self._set_action_status(f"Saved private {scope} note locally.")
+
+    def _delete_note(self, scope: str, button: object) -> None:
+        target = self._note_target(scope)
+        if target is None or self.annotations.get_note(target) is None:
+            self._set_action_status(f"No private {scope} note exists to delete.", warning=True)
+            return
+        if self._pending_note_delete != target:
+            self._pending_note_delete = target
+            button.set_label("Confirm delete")
+            self._set_action_status(
+                f"Press Confirm delete to remove this exact private {scope} note.", warning=True
+            )
+            return
+        self.annotations.delete_note(target)
+        self._note_view(scope).get_buffer().set_text("")
+        self._pending_note_delete = None
+        button.set_label(f"Delete {scope} note")
+        self._set_action_status(f"Deleted private {scope} note.")
+
+    def _load_entry_note(self) -> None:
+        if not hasattr(self, "entry_note_view"):
+            return
+        target = self._current_entry_target()
+        note = self.annotations.get_note(target) if target else None
+        self.entry_note_view.get_buffer().set_text(note.text if note else "")
+        self.entry_note_view.set_sensitive(target is not None)
+        self._pending_note_delete = None
+
     def _relationship_box(self, session: CatalogSession) -> object | None:
         parent = self.catalog.parent_of(session.session_id)
         children = self.catalog.children_of(session.session_id)
@@ -976,6 +1170,7 @@ class JournalWindow:
         self.redacted_check.set_active(False)
         self.errors_check.set_active(False)
         self.model = SessionBrowserModel(self.catalog)
+        self.model.set_bookmarked_session_ids(self.annotations.bookmarked_session_ids())
         self._hits_by_session.clear()
         self.model.select(session_id)
         self._populate_sessions()
@@ -985,6 +1180,7 @@ class JournalWindow:
     ) -> None:
         if row.get_expanded():
             self.current_entry_index = entry_index
+            self._load_entry_note()
 
     def _provenance_grid(self, session: CatalogSession, presented: PresentedEntry) -> object:
         entry = presented.entry

@@ -92,6 +92,12 @@ class ViewerModelTests(unittest.TestCase):
         self.model.set_search_hits((), active=False)
         self.assertEqual(len(self.model.sessions), 2)
 
+    def test_bookmark_filter_uses_separate_session_id_set(self) -> None:
+        session = self.model.sessions[0]
+        self.model.set_bookmarked_session_ids(frozenset({session.session_id}))
+        visible = self.model.set_filter("bookmarked_only", True)
+        self.assertEqual([item.session_id for item in visible], [session.session_id])
+
 
 if __name__ == "__main__":
     unittest.main()

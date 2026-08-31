@@ -9,9 +9,6 @@ from typing import Any
 
 
 MAX_VIEWER_STATE_BYTES = 256 * 1024
-THEMES = {"system", "light", "dark"}
-
-
 @dataclass(frozen=True)
 class ViewerState:
     selected_session_id: str | None = None
@@ -20,9 +17,6 @@ class ViewerState:
     window_height: int = 760
     content_visible: bool = False
     timeline_entry_index: int = 0
-    theme: str = "system"
-    sync_on_launch: bool = False
-    periodic_sync: bool = False
     last_sync_at: str | None = None
     last_sync_summary: str | None = None
 
@@ -47,6 +41,7 @@ def _clean_filters(value: object) -> dict[str, str | bool | None]:
         "source_kind",
         "redacted_only",
         "extraction_errors_only",
+        "bookmarked_only",
         "tag",
     }
     if not isinstance(value, dict):
@@ -82,9 +77,6 @@ class ViewerStateStore:
         session_id = payload.get("selected_session_id")
         if not isinstance(session_id, str) or len(session_id) > 256:
             session_id = None
-        theme = payload.get("theme")
-        if theme not in THEMES:
-            theme = "system"
         entry_index = payload.get("timeline_entry_index")
         if not isinstance(entry_index, int) or isinstance(entry_index, bool) or entry_index < 0:
             entry_index = 0
@@ -95,9 +87,6 @@ class ViewerStateStore:
             window_height=_bounded_dimension(payload.get("window_height"), 760),
             content_visible=_strict_bool(payload.get("content_visible", False)),
             timeline_entry_index=entry_index,
-            theme=theme,
-            sync_on_launch=_strict_bool(payload.get("sync_on_launch", False)),
-            periodic_sync=_strict_bool(payload.get("periodic_sync", False)),
             last_sync_at=(
                 payload.get("last_sync_at")
                 if isinstance(payload.get("last_sync_at"), str)
