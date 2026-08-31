@@ -6,6 +6,7 @@ from typing import Any
 
 from .viewer_catalog import CatalogError, CatalogSession, JournalCatalog
 from .viewer_model import ALL, SessionBrowserModel, display_start, session_badges
+from .viewer_presenter import PresentedEntry, present_timeline
 
 
 class JournalWindow:
@@ -314,44 +315,95 @@ class JournalWindow:
             empty.set_vexpand(False)
             self.content_box.append(empty)
         else:
-            timeline = self.Gtk.ListBox(selection_mode=self.Gtk.SelectionMode.NONE)
-            timeline.add_css_class("boxed-list")
-            for entry in detail.entries:
-                row = self.Gtk.Box(
-                    orientation=self.Gtk.Orientation.HORIZONTAL,
-                    spacing=14,
-                    margin_top=9,
-                    margin_bottom=9,
-                    margin_start=12,
-                    margin_end=12,
-                )
-                timestamp = self.Gtk.Label(label=entry.display_time, xalign=0, yalign=0)
-                timestamp.add_css_class("monospace")
-                timestamp.add_css_class("dim-label")
-                timestamp.set_size_request(52, -1)
-                text = self.Gtk.Label(label=entry.text, xalign=0, wrap=True, selectable=True)
-                text.set_hexpand(True)
-                row.append(timestamp)
-                row.append(text)
-                timeline.append(row)
+            timeline = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=8)
+            previous_date = None
+            for presented in present_timeline(detail):
+                if presented.local_date != previous_date:
+                    date = self.Gtk.Label(label=presented.date_label, xalign=0)
+                    date.add_css_class("heading")
+                    date.set_margin_top(8)
+                    timeline.append(date)
+                    previous_date = presented.local_date
+                timeline.append(self._timeline_row(session, presented))
             self.content_box.append(timeline)
 
         details = self.Gtk.Expander(label="Session details and provenance summary")
         details.set_child(self._details_grid(session))
         self.content_box.append(details)
+        if detail.extraction_errors:
+            errors = self.Gtk.Expander(
+                label=f"Extraction errors ({len(detail.extraction_errors)})"
+            )
+            error_box = self.Gtk.Box(
+                orientation=self.Gtk.Orientation.VERTICAL,
+                spacing=6,
+                margin_top=8,
+                margin_bottom=8,
+                margin_start=10,
+                margin_end=10,
+            )
+            for error in detail.extraction_errors:
+                label = self.Gtk.Label(
+                    label=f"Record {error.sequence}: {error.code}", xalign=0, selectable=True
+                )
+                label.add_css_class("warning")
+                error_box.append(label)
+            errors.set_child(error_box)
+            self.content_box.append(errors)
         self._show_state("content")
 
-    def _details_grid(self, session: CatalogSession) -> object:
-        grid = self.Gtk.Grid(
-            column_spacing=16,
-            row_spacing=8,
+    def _timeline_row(self, session: CatalogSession, presented: PresentedEntry) -> object:
+        row = self.Gtk.Expander()
+        row.add_css_class("card")
+        heading = self.Gtk.Box(
+            orientation=self.Gtk.Orientation.HORIZONTAL,
+            spacing=12,
             margin_top=10,
             margin_bottom=10,
-            margin_start=10,
-            margin_end=10,
+            margin_start=12,
+            margin_end=12,
         )
+        timestamp = self.Gtk.Label(label=presented.display_time, xalign=0, yalign=0)
+        timestamp.add_css_class("monospace")
+        timestamp.add_css_class("dim-label")
+        timestamp.set_size_request(52, -1)
+        body = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=5)
+        body.set_hexpand(True)
+        message = self.Gtk.Label(
+            label=presented.entry.text, xalign=0, wrap=True, selectable=True
+        )
+        body.append(message)
+        labels = (*presented.tags, *presented.indicators)
+        if labels:
+            tags = self.Gtk.Label(label="  ·  ".join(labels), xalign=0)
+            tags.add_css_class("caption")
+            if "failure" in labels or "security" in labels or "redacted" in labels:
+                tags.add_css_class("warning")
+            body.append(tags)
+        heading.append(timestamp)
+        heading.append(body)
+        row.set_label_widget(heading)
+        row.set_child(self._provenance_grid(session, presented))
+        return row
+
+    def _provenance_grid(self, session: CatalogSession, presented: PresentedEntry) -> object:
+        entry = presented.entry
+        values = (
+            ("Source session", session.session_id),
+            ("Event sequence", str(entry.source_event_sequence)),
+            ("Original UTC", entry.original_timestamp_utc),
+            ("Original-text SHA-256", entry.original_text_sha256),
+            ("Normalized text", entry.text),
+            ("Redacted", "yes" if entry.redacted else "no"),
+        )
+        return self._key_value_grid(values)
+
+    def _details_grid(self, session: CatalogSession) -> object:
+        parent = self.catalog.parent_of(session.session_id)
+        children = self.catalog.children_of(session.session_id)
         values = (
             ("Session", session.session_id),
+            ("Status", session.status),
             ("Started", session.started_at_utc),
             ("Ended", session.ended_at_utc or "Not recorded"),
             ("Timezone", session.rendered_timezone),
@@ -359,7 +411,26 @@ class JournalWindow:
             ("Repository", session.repository or "Not recorded"),
             ("Branch", session.branch or "Not recorded"),
             ("Source kind", session.source_kind),
+            ("Parent session", parent.session_id if parent else "Not linked"),
+            (
+                "Child sessions",
+                ", ".join(child.session_id for child in children) if children else "None linked",
+            ),
+            ("Timeline entries", str(session.entry_count)),
+            ("Redactions", str(session.redaction_count)),
+            ("Extraction errors", str(session.extraction_error_count)),
             ("Fingerprint", session.source_fingerprint),
+        )
+        return self._key_value_grid(values)
+
+    def _key_value_grid(self, values: tuple[tuple[str, str], ...]) -> object:
+        grid = self.Gtk.Grid(
+            column_spacing=16,
+            row_spacing=8,
+            margin_top=10,
+            margin_bottom=10,
+            margin_start=10,
+            margin_end=10,
         )
         for index, (label, value) in enumerate(values):
             key = self.Gtk.Label(label=label, xalign=1, yalign=0)
