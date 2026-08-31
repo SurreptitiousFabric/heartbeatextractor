@@ -6,7 +6,13 @@ import unittest
 from pathlib import Path
 
 from codex_journal.engine import JournalEngine
-from codex_journal.viewer_catalog import CatalogError, JournalCatalog, JournalSearchIndex
+from codex_journal.viewer_catalog import (
+    CatalogError,
+    JournalCatalog,
+    JournalSearchIndex,
+    SearchFilters,
+)
+from codex_journal.viewer_tags import classify_entry
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -62,6 +68,33 @@ class ViewerCatalogTests(unittest.TestCase):
             self.assertTrue(index.search(term))
             self.assertFalse(index.search(raw_secret))
         self.assertNotIn(raw_secret.encode(), database.read_bytes())
+
+    def test_search_filters_safe_metadata_tags_and_flags(self) -> None:
+        database = self.repo / "state" / "viewer.sqlite3"
+        session = self.catalog.sessions[0]
+        detail = self.catalog.load_detail(session.session_id)
+        tagged = next((entry for entry in detail.entries if classify_entry(entry.text)), None)
+        with JournalSearchIndex(database) as index:
+            index.rebuild(self.catalog)
+            by_project = index.search("", filters=SearchFilters(project=session.project))
+            self.assertTrue(by_project)
+            self.assertTrue(all(hit.project == session.project for hit in by_project))
+            ranged = index.search(
+                "",
+                filters=SearchFilters(date_from=session.local_date, date_to=session.local_date),
+            )
+            self.assertTrue(ranged)
+            if tagged is not None:
+                tag = classify_entry(tagged.text)[0]
+                hits = index.search("", filters=SearchFilters(tags=(tag,)))
+                self.assertTrue(hits)
+                self.assertTrue(all(tag in hit.tags for hit in hits))
+
+    def test_index_rebuild_does_not_fill_lazy_detail_cache(self) -> None:
+        self.catalog._details.clear()
+        with JournalSearchIndex(self.repo / "state" / "viewer.sqlite3") as index:
+            self.assertGreater(index.rebuild(self.catalog), 0)
+        self.assertEqual(self.catalog._details, {})
 
     def test_malformed_generated_artifact_fails_closed(self) -> None:
         malformed = self.repo / "journal" / "bad.md"

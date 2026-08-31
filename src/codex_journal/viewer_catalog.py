@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .viewer_tags import classify_entry
+
 
 MAX_METADATA_BYTES = 64 * 1024
 MAX_METADATA_LINE_BYTES = 16 * 1024
@@ -87,6 +89,21 @@ class SearchHit:
     text: str
     project: str
     branch: str | None
+    tags: tuple[str, ...]
+    redacted: bool
+
+
+@dataclass(frozen=True)
+class SearchFilters:
+    project: str | None = None
+    date_from: str | None = None
+    date_to: str | None = None
+    branch: str | None = None
+    status: str | None = None
+    redacted_only: bool = False
+    extraction_errors_only: bool = False
+    source_kind: str | None = None
+    tags: tuple[str, ...] = ()
 
 
 def _safe_relative(path: Path, root: Path) -> str:
@@ -259,11 +276,11 @@ class JournalCatalog:
         session = self._sessions.get(session_id)
         return self._sessions.get(session.parent_session_id) if session and session.parent_session_id else None
 
-    def load_detail(self, session_id: str) -> CatalogDetail:
+    def load_detail(self, session_id: str, *, cache: bool = True) -> CatalogDetail:
         session = self._sessions.get(session_id)
         if session is None:
             raise CatalogError("session is not present in the generated catalog")
-        cached = self._details.get(session_id)
+        cached = self._details.get(session_id) if cache else None
         if cached and cached[0] == session.source_fingerprint:
             return cached[1]
         journal_text = _read_bounded_text(session.journal_path, self.max_journal_bytes, "generated journal")
@@ -335,7 +352,8 @@ class JournalCatalog:
                 raise CatalogError("provenance extraction error has invalid fields")
             extraction_errors.append(CatalogExtractionError(sequence, code, detail))
         detail = CatalogDetail(session, tuple(entries), tuple(extraction_errors))
-        self._details[session_id] = (session.source_fingerprint, detail)
+        if cache:
+            self._details[session_id] = (session.source_fingerprint, detail)
         return detail
 
 
@@ -348,6 +366,17 @@ class JournalSearchIndex:
         self.connection = sqlite3.connect(path)
         try:
             self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS viewer_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            version = self.connection.execute(
+                "SELECT value FROM viewer_index_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if version != ("2",):
+                self.connection.execute("DROP TABLE IF EXISTS journal_search")
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO viewer_index_meta(key, value) VALUES ('schema_version', '2')"
+                )
+            self.connection.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS journal_search USING fts5(
                     session_id UNINDEXED,
@@ -358,6 +387,10 @@ class JournalSearchIndex:
                     branch,
                     status UNINDEXED,
                     source_kind UNINDEXED,
+                    local_date UNINDEXED,
+                    tags,
+                    redacted UNINDEXED,
+                    extraction_errors UNINDEXED,
                     tokenize = 'unicode61'
                 )
                 """
@@ -376,50 +409,104 @@ class JournalSearchIndex:
         self.close()
 
     def rebuild(self, catalog: JournalCatalog) -> int:
-        rows: list[tuple[Any, ...]] = []
-        for session in catalog.sessions:
-            detail = catalog.load_detail(session.session_id)
-            rows.extend(
-                (
-                    session.session_id,
-                    entry.index,
-                    entry.original_timestamp_utc,
-                    entry.text,
-                    session.project,
-                    session.branch or "",
-                    session.status,
-                    session.source_kind,
-                )
-                for entry in detail.entries
-            )
+        count = 0
         with self.connection:
             self.connection.execute("DELETE FROM journal_search")
-            self.connection.executemany(
-                """
-                INSERT INTO journal_search(
-                    session_id, entry_index, timestamp_utc, text, project, branch, status, source_kind
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-        return len(rows)
+            for session in catalog.sessions:
+                detail = catalog.load_detail(session.session_id, cache=False)
+                rows = [
+                    (
+                        session.session_id,
+                        entry.index,
+                        entry.original_timestamp_utc,
+                        entry.text,
+                        session.project,
+                        session.branch or "",
+                        session.status,
+                        session.source_kind,
+                        session.local_date,
+                        " ".join(classify_entry(entry.text)),
+                        "1" if entry.redacted else "0",
+                        "1" if session.extraction_error_count else "0",
+                    )
+                    for entry in detail.entries
+                ]
+                if rows:
+                    self.connection.executemany(
+                        """
+                        INSERT INTO journal_search(
+                            session_id, entry_index, timestamp_utc, text, project, branch,
+                            status, source_kind, local_date, tags, redacted, extraction_errors
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+                    count += len(rows)
+        return count
 
-    def search(self, query: str, *, limit: int = 100) -> tuple[SearchHit, ...]:
+    def search(
+        self,
+        query: str,
+        *,
+        filters: SearchFilters | None = None,
+        limit: int = 100,
+    ) -> tuple[SearchHit, ...]:
         cleaned = " ".join(query.split())
-        if not cleaned:
+        selected = filters or SearchFilters()
+        if not cleaned and selected == SearchFilters():
             return ()
-        phrase = '"' + cleaned.replace('"', '""') + '"'
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if cleaned:
+            clauses.append("journal_search MATCH ?")
+            parameters.append('"' + cleaned.replace('"', '""') + '"')
+        for column, value in (
+            ("project", selected.project),
+            ("branch", selected.branch),
+            ("status", selected.status),
+            ("source_kind", selected.source_kind),
+        ):
+            if value:
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        if selected.date_from:
+            clauses.append("local_date >= ?")
+            parameters.append(selected.date_from)
+        if selected.date_to:
+            clauses.append("local_date <= ?")
+            parameters.append(selected.date_to)
+        if selected.redacted_only:
+            clauses.append("redacted = '1'")
+        if selected.extraction_errors_only:
+            clauses.append("extraction_errors = '1'")
+        for tag in selected.tags:
+            clauses.append("(' ' || tags || ' ') LIKE ?")
+            parameters.append(f"% {tag} %")
+        where = " AND ".join(clauses) if clauses else "1 = 1"
+        parameters.append(max(1, min(limit, 1000)))
         try:
             rows = self.connection.execute(
-                """
-                SELECT session_id, entry_index, timestamp_utc, text, project, branch
+                f"""
+                SELECT session_id, entry_index, timestamp_utc, text, project, branch, tags, redacted
                 FROM journal_search
-                WHERE journal_search MATCH ?
+                WHERE {where}
                 ORDER BY timestamp_utc DESC, session_id, entry_index
                 LIMIT ?
-                """,
-                (phrase, max(1, min(limit, 1000))),
+                """,  # nosec B608: predicates are selected from constants above
+                parameters,
             ).fetchall()
         except sqlite3.Error as exc:
             raise CatalogError("viewer search query failed safely") from exc
-        return tuple(SearchHit(row[0], int(row[1]), row[2], row[3], row[4], row[5] or None) for row in rows)
+        return tuple(
+            SearchHit(
+                row[0],
+                int(row[1]),
+                row[2],
+                row[3],
+                row[4],
+                row[5] or None,
+                tuple(row[6].split()),
+                row[7] == "1",
+            )
+            for row in rows
+        )

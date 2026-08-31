@@ -4,9 +4,17 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .viewer_catalog import CatalogError, CatalogSession, JournalCatalog
+from .viewer_catalog import (
+    CatalogError,
+    CatalogSession,
+    JournalCatalog,
+    JournalSearchIndex,
+    SearchFilters,
+    SearchHit,
+)
 from .viewer_model import ALL, SessionBrowserModel, display_start, session_badges
 from .viewer_presenter import PresentedEntry, present_timeline
+from .viewer_tags import TAGS
 
 
 class JournalWindow:
@@ -19,6 +27,8 @@ class JournalWindow:
         self.model = SessionBrowserModel(self.catalog)
         self._session_rows: dict[object, str] = {}
         self._filter_widgets: dict[str, object] = {}
+        self._hits_by_session: dict[str, SearchHit] = {}
+        self.search_index: JournalSearchIndex | None = None
         self._loading = False
 
         self.window = self.Adw.ApplicationWindow(application=application)
@@ -32,9 +42,10 @@ class JournalWindow:
         self.split.set_sidebar(self.Adw.NavigationPage.new(self._build_sidebar(), "Sessions"))
         self.split.set_content(self.Adw.NavigationPage.new(self._build_main(), "Journal"))
         self.window.set_content(self.split)
+        self.window.connect("close-request", self._on_close)
 
         breakpoint = self.Adw.Breakpoint.new(
-            self.Adw.BreakpointCondition.parse("max-width: 700px")
+            self.Adw.BreakpointCondition.parse("max-width: 1000px")
         )
         breakpoint.add_setter(self.split, "collapsed", True)
         self.window.add_breakpoint(breakpoint)
@@ -53,6 +64,14 @@ class JournalWindow:
         toolbar.add_top_bar(header)
 
         outer = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=0)
+        self.search_entry = self.Gtk.SearchEntry(
+            placeholder_text="Search safe journals",
+            margin_top=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        outer.append(self.search_entry)
         filters = self.Gtk.Box(
             orientation=self.Gtk.Orientation.VERTICAL,
             spacing=8,
@@ -63,9 +82,12 @@ class JournalWindow:
         )
         for field, label in (
             ("project", "Project"),
-            ("local_date", "Date"),
+            ("date_from", "From"),
+            ("date_to", "To"),
             ("branch", "Branch"),
             ("status", "Status"),
+            ("source_kind", "Source"),
+            ("tag", "Tag"),
         ):
             row = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=8)
             caption = self.Gtk.Label(label=label, xalign=0)
@@ -77,6 +99,14 @@ class JournalWindow:
             row.append(caption)
             row.append(dropdown)
             filters.append(row)
+        self.redacted_check = self.Gtk.CheckButton(label="Has redactions")
+        self.redacted_check.connect("toggled", self._on_boolean_filter, "redacted_only")
+        filters.append(self.redacted_check)
+        self.errors_check = self.Gtk.CheckButton(label="Has extraction errors")
+        self.errors_check.connect(
+            "toggled", self._on_boolean_filter, "extraction_errors_only"
+        )
+        filters.append(self.errors_check)
         outer.append(filters)
 
         self.count_label = self.Gtk.Label(
@@ -161,6 +191,10 @@ class JournalWindow:
         try:
             self.catalog.refresh()
             self.model = SessionBrowserModel(self.catalog)
+            if self.search_index is not None:
+                self.search_index.close()
+            self.search_index = JournalSearchIndex(self.repo_root / "state" / "viewer.sqlite3")
+            self.search_index.rebuild(self.catalog)
             self._populate_filters()
             self._populate_sessions()
             if not self.catalog.sessions:
@@ -176,6 +210,12 @@ class JournalWindow:
             self._loading = False
         return False
 
+    def _on_close(self, *_args: object) -> bool:
+        if self.search_index is not None:
+            self.search_index.close()
+            self.search_index = None
+        return False
+
     def _show_catalog_error(self) -> None:
         count = len(self.catalog.diagnostics)
         self.error_page.set_title("Generated journal catalog is malformed")
@@ -187,9 +227,12 @@ class JournalWindow:
     def _filter_values(self, field: str) -> tuple[str, ...]:
         return {
             "project": self.model.projects,
-            "local_date": self.model.dates,
+            "date_from": tuple(reversed(self.model.dates)),
+            "date_to": tuple(reversed(self.model.dates)),
             "branch": self.model.branches,
             "status": self.model.statuses,
+            "source_kind": self.model.source_kinds,
+            "tag": TAGS,
         }[field]
 
     def _populate_filters(self) -> None:
@@ -205,7 +248,36 @@ class JournalWindow:
         if self._loading:
             return
         self.model.set_filter(field, self._selected_text(dropdown))
+        self._apply_search()
         self._populate_sessions()
+
+    def _on_boolean_filter(self, button: object, field: str) -> None:
+        if self._loading:
+            return
+        self.model.set_filter(field, bool(button.get_active()))
+        self._populate_sessions()
+
+    def _on_search_changed(self, _entry: object) -> None:
+        if self._loading:
+            return
+        self._apply_search()
+        self._populate_sessions()
+
+    def _apply_search(self) -> None:
+        if self.search_index is None:
+            return
+        query = self.search_entry.get_text()
+        tag = self.model.filters.tag
+        active = bool(query.strip() or tag)
+        hits = self.search_index.search(
+            query,
+            filters=SearchFilters(tags=(tag,) if tag else ()),
+            limit=1000,
+        ) if active else ()
+        self.model.set_search_hits(hits, active=active)
+        self._hits_by_session = {}
+        for hit in hits:
+            self._hits_by_session.setdefault(hit.session_id, hit)
 
     def _clear_box(self, box: object) -> None:
         while child := box.get_first_child():
@@ -259,6 +331,12 @@ class JournalWindow:
         if session.extraction_error_count or session.redaction_count:
             badges.add_css_class("warning")
         box.append(badges)
+        hit = self._hits_by_session.get(session.session_id)
+        if hit is not None:
+            context = self.Gtk.Label(label=f"Match: {hit.text}", xalign=0, ellipsize=3)
+            context.add_css_class("accent")
+            context.set_tooltip_text(hit.text)
+            box.append(context)
         return box
 
     def _on_session_selected(self, _list: object, row: object | None) -> None:
@@ -317,6 +395,8 @@ class JournalWindow:
         else:
             timeline = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=8)
             previous_date = None
+            target_index = self.model.matching_entry(session.session_id)
+            target_widget = None
             for presented in present_timeline(detail):
                 if presented.local_date != previous_date:
                     date = self.Gtk.Label(label=presented.date_label, xalign=0)
@@ -324,8 +404,15 @@ class JournalWindow:
                     date.set_margin_top(8)
                     timeline.append(date)
                     previous_date = presented.local_date
-                timeline.append(self._timeline_row(session, presented))
+                widget = self._timeline_row(session, presented)
+                if presented.entry.index == target_index:
+                    widget.add_css_class("accent")
+                    widget.set_expanded(True)
+                    target_widget = widget
+                timeline.append(widget)
             self.content_box.append(timeline)
+            if target_widget is not None:
+                self.GLib.idle_add(target_widget.grab_focus)
 
         details = self.Gtk.Expander(label="Session details and provenance summary")
         details.set_child(self._details_grid(session))

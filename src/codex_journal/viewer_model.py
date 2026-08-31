@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 
-from .viewer_catalog import CatalogSession, JournalCatalog
+from .viewer_catalog import CatalogSession, JournalCatalog, SearchHit
 
 
 ALL = "All"
@@ -12,9 +12,14 @@ ALL = "All"
 @dataclass(frozen=True)
 class BrowserFilters:
     project: str | None = None
-    local_date: str | None = None
+    date_from: str | None = None
+    date_to: str | None = None
     branch: str | None = None
     status: str | None = None
+    source_kind: str | None = None
+    redacted_only: bool = False
+    extraction_errors_only: bool = False
+    tag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,7 @@ class SessionBrowserModel:
         self.catalog = catalog
         self.filters = BrowserFilters()
         self.selected_session_id: str | None = None
+        self._search_matches: dict[str, int] | None = None
 
     @property
     def sessions(self) -> tuple[CatalogSession, ...]:
@@ -40,9 +46,14 @@ class SessionBrowserModel:
             session
             for session in self.catalog.sessions
             if (filters.project is None or session.project == filters.project)
-            and (filters.local_date is None or session.local_date == filters.local_date)
+            and (filters.date_from is None or session.local_date >= filters.date_from)
+            and (filters.date_to is None or session.local_date <= filters.date_to)
             and (filters.branch is None or session.branch == filters.branch)
             and (filters.status is None or session.status == filters.status)
+            and (filters.source_kind is None or session.source_kind == filters.source_kind)
+            and (not filters.redacted_only or session.redaction_count > 0)
+            and (not filters.extraction_errors_only or session.extraction_error_count > 0)
+            and (self._search_matches is None or session.session_id in self._search_matches)
         )
 
     @property
@@ -75,6 +86,10 @@ class SessionBrowserModel:
         return tuple(status for status in preferred if status in available)
 
     @property
+    def source_kinds(self) -> tuple[str, ...]:
+        return tuple(sorted({session.source_kind for session in self.catalog.sessions}, key=str.casefold))
+
+    @property
     def counts(self) -> BrowserCounts:
         visible = self.sessions
         return BrowserCounts(
@@ -88,15 +103,30 @@ class SessionBrowserModel:
             + len(self.catalog.diagnostics),
         )
 
-    def set_filter(self, field: str, value: str | None) -> tuple[CatalogSession, ...]:
+    def set_filter(self, field: str, value: str | bool | None) -> tuple[CatalogSession, ...]:
         if field not in BrowserFilters.__dataclass_fields__:
             raise ValueError(f"unknown browser filter: {field}")
-        normalized = value if value and value != ALL else None
+        normalized = value if value and value != ALL else (False if isinstance(value, bool) else None)
         self.filters = replace(self.filters, **{field: normalized})
         visible = self.sessions
         if self.selected_session_id not in {session.session_id for session in visible}:
             self.selected_session_id = visible[0].session_id if visible else None
         return visible
+
+    def set_search_hits(
+        self, hits: tuple[SearchHit, ...], *, active: bool
+    ) -> tuple[CatalogSession, ...]:
+        matches: dict[str, int] = {}
+        for hit in hits:
+            matches.setdefault(hit.session_id, hit.entry_index)
+        self._search_matches = matches if active else None
+        visible = self.sessions
+        if self.selected_session_id not in {session.session_id for session in visible}:
+            self.selected_session_id = visible[0].session_id if visible else None
+        return visible
+
+    def matching_entry(self, session_id: str) -> int | None:
+        return self._search_matches.get(session_id) if self._search_matches is not None else None
 
     def select(self, session_id: str | None) -> CatalogSession | None:
         if session_id is None:

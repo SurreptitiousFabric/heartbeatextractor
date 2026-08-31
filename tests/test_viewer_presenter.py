@@ -5,7 +5,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from codex_journal.viewer_catalog import CatalogDetail, CatalogEntry, CatalogSession
-from codex_journal.viewer_presenter import classify_entry, present_entry, present_timeline
+from codex_journal.viewer_presenter import present_entry, present_timeline
+from codex_journal.viewer_tags import classify_entry
 
 
 def session(**changes: object) -> CatalogSession:
@@ -41,6 +42,13 @@ class ViewerPresenterTests(unittest.TestCase):
             tags,
             ("failure", "test", "security", "blocker", "correction", "commit"),
         )
+
+    def test_issue_and_stop_tags_do_not_rewrite_safe_identifiers(self) -> None:
+        text = "Stopped before pushing commit abc123 for #35; work remains uncommitted."
+        self.assertIn("issue/PR", classify_entry(text))
+        self.assertIn("stop", classify_entry(text))
+        self.assertIn("#35", text)
+        self.assertIn("abc123", text)
 
     def test_dst_fallback_keeps_repeated_minutes_as_distinct_entries(self) -> None:
         first = entry(0, "2026-10-25T00:00:00Z", "First repeated minute.")

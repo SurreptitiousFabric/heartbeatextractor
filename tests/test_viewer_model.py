@@ -7,6 +7,7 @@ from pathlib import Path
 
 from codex_journal.engine import JournalEngine
 from codex_journal.viewer_catalog import JournalCatalog
+from codex_journal.viewer_catalog import SearchHit
 from codex_journal.viewer_model import ALL, SessionBrowserModel, display_start, session_badges
 
 
@@ -43,7 +44,8 @@ class ViewerModelTests(unittest.TestCase):
     def test_project_branch_date_and_status_filters_compose(self) -> None:
         session = self.model.sessions[0]
         self.model.set_filter("project", session.project)
-        self.model.set_filter("local_date", session.local_date)
+        self.model.set_filter("date_from", session.local_date)
+        self.model.set_filter("date_to", session.local_date)
         if session.branch:
             self.model.set_filter("branch", session.branch)
         self.model.set_filter("status", session.status)
@@ -71,6 +73,24 @@ class ViewerModelTests(unittest.TestCase):
     def test_unknown_filter_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown browser filter"):
             self.model.set_filter("raw_source", "private")
+
+    def test_search_hits_filter_sessions_and_remember_entry(self) -> None:
+        session = self.model.sessions[-1]
+        hit = SearchHit(
+            session.session_id,
+            7,
+            session.started_at_utc,
+            "Safe matching context.",
+            session.project,
+            session.branch,
+            ("test",),
+            False,
+        )
+        visible = self.model.set_search_hits((hit,), active=True)
+        self.assertEqual([item.session_id for item in visible], [session.session_id])
+        self.assertEqual(self.model.matching_entry(session.session_id), 7)
+        self.model.set_search_hits((), active=False)
+        self.assertEqual(len(self.model.sessions), 2)
 
 
 if __name__ == "__main__":

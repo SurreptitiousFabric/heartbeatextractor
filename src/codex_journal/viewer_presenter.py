@@ -1,21 +1,11 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .viewer_catalog import CatalogDetail, CatalogEntry, CatalogSession
-
-
-TAG_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("failure", re.compile(r"\b(?:fail(?:ed|ure)?|error|defect|broken)\b", re.IGNORECASE)),
-    ("test", re.compile(r"\b(?:test(?:s|ed|ing)?|validation|contract(?:s)?|pass(?:ed|ing)?)\b", re.IGNORECASE)),
-    ("security", re.compile(r"\b(?:security|credential|secret|token|permission|fail-open|vulnerab\w*)\b", re.IGNORECASE)),
-    ("blocker", re.compile(r"\b(?:blocker(?:s)?|blocked|objection(?:s)?)\b", re.IGNORECASE)),
-    ("correction", re.compile(r"\b(?:correct(?:ed|ion)?|fix(?:ed)?|withdrawn|retracted)\b", re.IGNORECASE)),
-    ("commit", re.compile(r"\b(?:commit(?:ted)?|push(?:ed)?|pull request|issue update|pr update)\b", re.IGNORECASE)),
-)
+from .viewer_tags import classify_entry
 
 
 @dataclass(frozen=True)
@@ -26,10 +16,6 @@ class PresentedEntry:
     display_time: str
     tags: tuple[str, ...]
     indicators: tuple[str, ...]
-
-
-def classify_entry(text: str) -> tuple[str, ...]:
-    return tuple(label for label, pattern in TAG_PATTERNS if pattern.search(text))
 
 
 def present_entry(entry: CatalogEntry, session: CatalogSession) -> PresentedEntry:
