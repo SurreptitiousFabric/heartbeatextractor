@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -82,7 +83,10 @@ def journal_relative_path(cache: SessionCache, zone: tzinfo) -> Path:
     if started is None:
         raise ValueError(f"invalid start timestamp for {cache.session_id}")
     local = started.astimezone(zone)
-    short_id = re.sub(r"[^A-Za-z0-9]", "", cache.session_id)[:8].lower()
+    compact_id = re.sub(r"[^A-Za-z0-9]", "", cache.session_id).lower()
+    prefix = compact_id[:8] or "session"
+    digest = hashlib.sha256(cache.session_id.encode("utf-8")).hexdigest()[:12]
+    short_id = f"{prefix}-{digest}"
     filename = f"{local:%H%M}-{project_slug(cache)}-{short_id}.md"
     return Path("journal") / f"{local:%Y}" / f"{local:%m}" / f"{local:%d}" / filename
 

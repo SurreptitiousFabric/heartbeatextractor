@@ -338,6 +338,37 @@ class PrivacyAndIndexTests(JournalTestCase):
         self.assertTrue((self.repo / "projects" / "a-quo.md").is_file())
         self.assertFalse(self.engine.verify().errors)
 
+    def test_19b_same_uuid_prefix_gets_distinct_stable_paths(self) -> None:
+        first = "01a048d8-e03f-76f1-b73f-e1f540562b8a"
+        second = "01a048d8-df74-7470-955d-ef6dcfa9989c"
+        for number, session_id in enumerate((first, second)):
+            records = [
+                session_meta(session_id, "2026-08-31T08:00:00Z", "/home/tester/src/shared-project"),
+                lifecycle("task_started", "2026-08-31T08:00:01Z"),
+                commentary(f"Validated shared-prefix session {number}.", "2026-08-31T08:00:10Z"),
+                lifecycle("task_complete", "2026-08-31T08:00:11Z"),
+            ]
+            self.source(f"shared-{number}.jsonl", records)
+        self.engine.sync(timezone_name="Europe/Zurich")
+        paths = sorted((self.repo / "journal").rglob("*.md"))
+        self.assertEqual(len(paths), 2)
+        self.assertNotEqual(paths[0].name, paths[1].name)
+        self.assertTrue(all("01a048d8-" in path.name for path in paths))
+        first_names = [path.name for path in paths]
+        self.engine.sync(timezone_name="Europe/Zurich")
+        self.assertEqual(first_names, [path.name for path in sorted((self.repo / "journal").rglob("*.md"))])
+        self.assertFalse(self.engine.verify().errors)
+
+    def test_19c_verify_detects_missing_cached_session_journal(self) -> None:
+        self.fixture("normal_completed.jsonl")
+        self.fixture("acceptance.jsonl")
+        self.engine.sync(timezone_name="Europe/Zurich")
+        missing = self.journal_for("44444444-4444-4444-8444-444444444444")
+        missing.unlink()
+        missing.with_suffix(".provenance.json").unlink()
+        errors = self.engine.verify().errors
+        self.assertTrue(any("processing state sessions missing generated journals" in error for error in errors))
+
     def test_20_acceptance_timeline(self) -> None:
         self.fixture("acceptance.jsonl")
         self.engine.sync(timezone_name="Europe/Zurich")

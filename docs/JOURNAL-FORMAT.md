@@ -3,6 +3,12 @@
 Format version 1 creates one Markdown journal and one JSON provenance companion
 per source session. Parent and sub-agent sessions remain separate.
 
+Filenames contain the first eight alphanumeric session-ID characters plus a
+12-hex SHA-256 suffix derived from the complete session ID. This keeps the
+identifier compact and stable while distinguishing UUIDv7 sessions spawned in
+the same timestamp window. Verification fails if any two cached sessions map
+to one path or if cached, generated, provenance, and indexed inventories differ.
+
 ## Selection boundary
 
 Only `response_item/message` records with assistant role, commentary phase, an

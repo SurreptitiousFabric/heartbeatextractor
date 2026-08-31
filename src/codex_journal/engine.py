@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 from pathlib import Path
 
 from .model import SessionCache, SourceSession, SyncResult, VerifyResult
@@ -22,7 +23,7 @@ from .render import (
     render_journal,
     resolve_timezone,
 )
-from .state import StateStore
+from .state import StateStore, read_all_readonly
 
 
 LINK_RE = re.compile(r"\]\(([^)]+)\)")
@@ -109,6 +110,18 @@ class JournalEngine:
             for cache_id, cache in all_caches.items():
                 target_zone = zone if cache_id in selected_ids else resolve_timezone(cache.rendered_timezone)[0]
                 relation_paths[cache_id] = journal_relative_path(cache, target_zone)
+            path_owners: dict[Path, list[str]] = {}
+            for cache_id, path in relation_paths.items():
+                path_owners.setdefault(path, []).append(cache_id)
+            path_collision_found = False
+            for path, owner_ids in sorted(path_owners.items(), key=lambda item: item[0].as_posix()):
+                if len(owner_ids) > 1:
+                    path_collision_found = True
+                    result.errors.append(
+                        f"journal path collision: {path.as_posix()} sessions={','.join(sorted(owner_ids))}"
+                    )
+            if path_collision_found:
+                return result
             children: dict[str, list[str]] = {}
             for cache in all_caches.values():
                 if cache.parent_session_id:
@@ -153,6 +166,33 @@ class JournalEngine:
         for session_id in sorted(duplicates):
             result.errors.append(f"duplicate source session ID: {session_id}")
         source_by_id = {session.session_id: session for session in sessions if session.session_id not in duplicates}
+        try:
+            cached_sessions = read_all_readonly(self.state_path)
+        except (OSError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+            result.errors.append(f"malformed processing state: {exc}")
+            cached_sessions = []
+        cached_by_id = {cache.session_id: cache for cache in cached_sessions}
+        source_ids = set(source_by_id)
+        cached_ids = set(cached_by_id)
+        unsynced_ids = sorted(source_ids - cached_ids)
+        orphaned_ids = sorted(cached_ids - source_ids)
+        if unsynced_ids:
+            result.errors.append(
+                f"source sessions missing from processing state: count={len(unsynced_ids)} ids={','.join(unsynced_ids[:8])}"
+            )
+        if orphaned_ids:
+            result.errors.append(
+                f"processing state has missing source sessions: count={len(orphaned_ids)} ids={','.join(orphaned_ids[:8])}"
+            )
+        cached_path_owners: dict[str, list[str]] = {}
+        for cache in cached_sessions:
+            if cache.journal_relpath:
+                cached_path_owners.setdefault(cache.journal_relpath, []).append(cache.session_id)
+        for path, owner_ids in sorted(cached_path_owners.items()):
+            if len(owner_ids) > 1:
+                result.errors.append(
+                    f"processing state journal path collision: {path} sessions={','.join(sorted(owner_ids))}"
+                )
         seen: dict[str, Path] = {}
         journals = sorted((self.repo_root / "journal").rglob("*.md"))
         for journal in journals:
@@ -172,6 +212,11 @@ class JournalEngine:
                     f"duplicate generated session ID {session_id}: {seen[session_id].relative_to(self.repo_root)} and {journal.relative_to(self.repo_root)}"
                 )
             seen[session_id] = journal
+            cached = cached_by_id.get(session_id)
+            if cached is None:
+                result.errors.append(f"{journal.relative_to(self.repo_root)}: session absent from processing state")
+            elif cached.journal_relpath != journal.relative_to(self.repo_root).as_posix():
+                result.errors.append(f"{journal.relative_to(self.repo_root)}: path disagrees with processing state")
             if metadata.get("generated_by") != "codex-journal" or metadata.get("format_version") != 1:
                 result.errors.append(f"{journal.relative_to(self.repo_root)}: unsupported generator or format")
             source = source_by_id.get(session_id)
@@ -200,7 +245,19 @@ class JournalEngine:
             elif any(entry.get("source_session_id") != session_id for entry in provenance_entries if isinstance(entry, dict)):
                 result.errors.append(f"{provenance_path.relative_to(self.repo_root)}: provenance session mismatch")
 
-        root_index_targets: set[Path] = set()
+        generated_ids = set(seen)
+        missing_generated_ids = sorted(cached_ids - generated_ids)
+        unexpected_generated_ids = sorted(generated_ids - cached_ids)
+        if missing_generated_ids:
+            result.errors.append(
+                f"processing state sessions missing generated journals: count={len(missing_generated_ids)} ids={','.join(missing_generated_ids[:8])}"
+            )
+        if unexpected_generated_ids:
+            result.errors.append(
+                f"generated journals absent from processing state: count={len(unexpected_generated_ids)} ids={','.join(unexpected_generated_ids[:8])}"
+            )
+
+        root_index_targets: dict[Path, int] = {}
         for index in [self.repo_root / "INDEX.md", *sorted((self.repo_root / "projects").glob("*.md"))]:
             if not index.is_file():
                 result.errors.append(f"missing index: {index.relative_to(self.repo_root)}")
@@ -222,10 +279,15 @@ class JournalEngine:
                 if not resolved.is_file():
                     result.errors.append(f"{index.relative_to(self.repo_root)}: broken link: {target}")
                 elif index == self.repo_root / "INDEX.md":
-                    root_index_targets.add(resolved)
+                    root_index_targets[resolved] = root_index_targets.get(resolved, 0) + 1
         for journal in journals:
-            if journal.resolve() not in root_index_targets:
+            link_count = root_index_targets.get(journal.resolve(), 0)
+            if link_count == 0:
                 result.errors.append(f"INDEX.md: journal is not indexed: {journal.relative_to(self.repo_root)}")
+            elif link_count > 1:
+                result.errors.append(
+                    f"INDEX.md: journal is indexed {link_count} times: {journal.relative_to(self.repo_root)}"
+                )
         return result
 
 

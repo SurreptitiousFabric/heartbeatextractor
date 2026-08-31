@@ -61,3 +61,16 @@ class StateStore:
     def all(self) -> list[SessionCache]:
         rows = self.connection.execute("SELECT data_json FROM sessions").fetchall()
         return [SessionCache.from_dict(json.loads(row[0])) for row in rows]
+
+
+def read_all_readonly(path: Path) -> list[SessionCache]:
+    """Read existing state without creating or modifying the database."""
+
+    if not path.is_file():
+        return []
+    connection = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        rows = connection.execute("SELECT data_json FROM sessions").fetchall()
+    finally:
+        connection.close()
+    return [SessionCache.from_dict(json.loads(row[0])) for row in rows]
