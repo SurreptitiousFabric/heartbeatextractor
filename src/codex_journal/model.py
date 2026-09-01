@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
+
+
+class ExtractionMode(Enum):
+    UNCHANGED = "unchanged"
+    APPEND = "append"
+    REBUILD = "rebuild"
 
 
 @dataclass(frozen=True)
@@ -107,6 +114,12 @@ class SessionCache:
         copied["candidates"] = [Candidate.from_dict(v) for v in copied.get("candidates", [])]
         copied["errors"] = [ExtractionError.from_dict(v) for v in copied.get("errors", [])]
         return cls(**copied)
+
+
+@dataclass(frozen=True)
+class ExtractionOutcome:
+    cache: SessionCache
+    mode: ExtractionMode
 
 
 @dataclass

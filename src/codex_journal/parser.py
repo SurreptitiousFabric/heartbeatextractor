@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
 
-from .model import Candidate, ExtractionError, SessionCache, SourceSession
+from .model import (
+    Candidate,
+    ExtractionError,
+    ExtractionMode,
+    ExtractionOutcome,
+    SessionCache,
+    SourceSession,
+)
 from .redact import redact_text
 
 
@@ -244,14 +251,14 @@ def extract_session(
     home: Path,
     force_rebuild: bool = False,
     max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,
-) -> tuple[SessionCache, str]:
-    """Extract a source and return cache plus mode: unchanged/append/rebuild."""
+) -> ExtractionOutcome:
+    """Extract a fixed source snapshot and describe how its cache was obtained."""
 
     source_size = source.path.stat().st_size
     # Work against a fixed byte snapshot. If the active file grows during this
     # call, the new suffix remains for the next append pass.
     fingerprint = sha256_file(source.path, source_size)
-    mode = "rebuild"
+    mode = ExtractionMode.REBUILD
     cache: SessionCache
     start_offset = 0
     start_sequence = 0
@@ -263,7 +270,7 @@ def extract_session(
             and previous.source_fingerprint == fingerprint
         ):
             _copy_source_metadata(previous, source)
-            return previous, "unchanged"
+            return ExtractionOutcome(previous, ExtractionMode.UNCHANGED)
         append_ok = (
             previous.source_key == source.source_key
             and source_size > previous.source_size
@@ -279,7 +286,7 @@ def extract_session(
             _copy_source_metadata(cache, source)
             start_offset = cache.processed_offset
             start_sequence = cache.next_sequence
-            mode = "append"
+            mode = ExtractionMode.APPEND
         else:
             cache = _fresh_cache(source)
     else:
@@ -364,7 +371,7 @@ def extract_session(
     cache.processed_prefix_sha256 = sha256_file(source.path, processed_offset)
     cache.source_size = source_size
     cache.source_fingerprint = fingerprint
-    return cache, mode
+    return ExtractionOutcome(cache, mode)
 
 
 def safe_slug(value: str) -> str:

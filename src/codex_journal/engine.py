@@ -5,8 +5,9 @@ import os
 import re
 import sqlite3
 from pathlib import Path
+from typing import assert_never
 
-from .model import SessionCache, SourceSession, SyncResult, VerifyResult
+from .model import ExtractionMode, SessionCache, SourceSession, SyncResult, VerifyResult
 from .parser import (
     DEFAULT_MAX_RECORD_BYTES,
     discover_sessions,
@@ -87,22 +88,26 @@ class JournalEngine:
                 previous = store.get(source.session_id)
                 if force_rebuild:
                     previous = None
-                cache, mode = extract_session(
+                outcome = extract_session(
                     source,
                     previous,
                     home=self.home,
                     force_rebuild=force_rebuild,
                     max_record_bytes=self.max_record_bytes,
                 )
-                store.save(cache)
+                cache = outcome.cache
                 processed[cache.session_id] = cache
                 result.processed += 1
-                if mode == "unchanged":
-                    result.unchanged += 1
-                elif mode == "append":
-                    result.appended += 1
-                else:
-                    result.rebuilt += 1
+                match outcome.mode:
+                    case ExtractionMode.UNCHANGED:
+                        result.unchanged += 1
+                    case ExtractionMode.APPEND:
+                        result.appended += 1
+                    case ExtractionMode.REBUILD:
+                        result.rebuilt += 1
+                    case impossible:
+                        assert_never(impossible)
+                store.save(cache)
 
             all_caches = {cache.session_id: cache for cache in store.all()}
             all_caches.update(processed)

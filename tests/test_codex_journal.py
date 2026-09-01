@@ -12,10 +12,11 @@ from unittest import mock
 
 from codex_journal.compact import compact_candidates
 from codex_journal.engine import JournalEngine
-from codex_journal.model import Candidate
-from codex_journal.parser import duplicate_session_ids
+from codex_journal.model import Candidate, ExtractionOutcome
+from codex_journal.parser import duplicate_session_ids, extract_session
 from codex_journal.redact import redact_text, shorten_home
 from codex_journal.render import atomic_write, parse_front_matter
+from codex_journal.state import read_all_readonly
 from codex_journal.viewer import ViewerUnavailable, load_gtk
 
 
@@ -134,6 +135,28 @@ class ExtractionTests(JournalTestCase):
         self.assertEqual(second.appended, 1)
         self.assertIn("Completed append-only validation.", self.timeline(journal))
         self.assertEqual(parse_front_matter(journal)[0]["status"], "completed")
+
+    def test_02b_extraction_outcome_is_structured_for_each_mode(self) -> None:
+        source_path = self.fixture("active_append.jsonl")
+        source = self.engine.discover()[0][0]
+        rebuilt = extract_session(source, None, home=Path("/home/tester"))
+        self.assertEqual(rebuilt.mode.value, "rebuild")
+        unchanged = extract_session(source, rebuilt.cache, home=Path("/home/tester"))
+        self.assertEqual(unchanged.mode.value, "unchanged")
+        with source_path.open("a", encoding="utf-8") as output:
+            output.write(json_line(commentary("Validated the appended suffix.", "2026-08-31T10:01:00Z")))
+        appended = extract_session(source, unchanged.cache, home=Path("/home/tester"))
+        self.assertEqual(appended.mode.value, "append")
+
+    def test_02c_engine_rejects_an_impossible_extraction_mode(self) -> None:
+        self.fixture("active_append.jsonl")
+        source = self.engine.discover()[0][0]
+        valid = extract_session(source, None, home=Path("/home/tester"))
+        impossible = ExtractionOutcome(valid.cache, mock.sentinel.impossible_mode)
+        with mock.patch("codex_journal.engine.extract_session", return_value=impossible):
+            with self.assertRaises(AssertionError):
+                self.engine.sync(timezone_name="Europe/Zurich")
+        self.assertEqual(read_all_readonly(self.repo / "state" / "journal.sqlite3"), [])
 
     def test_03_subagent_activity_and_parent_links(self) -> None:
         self.fixture("normal_completed.jsonl")
