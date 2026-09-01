@@ -15,9 +15,6 @@ from .parser import parse_timestamp, project_slug, project_title
 from .redact import shorten_home
 
 
-TIMELINE_RE = re.compile(r"^\d{2}:\d{2}  ")
-
-
 def resolve_timezone(name: str | None) -> tuple[tzinfo, str]:
     if name:
         try:
@@ -225,31 +222,3 @@ def render_indexes(repo_root: Path, caches: list[SessionCache], *, home: Path | 
         atomic_write(path, "\n".join(lines).encode("utf-8"))
         written.append(path)
     return written
-
-
-def parse_front_matter(path: Path) -> tuple[dict[str, object], list[str]]:
-    errors: list[str] = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        return {}, [f"cannot read: {exc}"]
-    if not lines or lines[0] != "---":
-        return {}, ["missing opening metadata delimiter"]
-    metadata: dict[str, object] = {}
-    for line in lines[1:]:
-        if line == "---":
-            return metadata, errors
-        if ": " not in line:
-            errors.append(f"malformed metadata line: {line!r}")
-            continue
-        key, raw = line.split(": ", 1)
-        try:
-            metadata[key] = json.loads(raw)
-        except json.JSONDecodeError:
-            errors.append(f"malformed metadata value for {key}")
-    errors.append("missing closing metadata delimiter")
-    return metadata, errors
-
-
-def count_timeline_entries(path: Path) -> int:
-    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if TIMELINE_RE.match(line))

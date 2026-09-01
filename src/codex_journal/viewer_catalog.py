@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
+from .artifacts import (
+    MAX_JOURNAL_BYTES,
+    MAX_PROVENANCE_BYTES,
+    DecodedJournal,
+    DecodedProvenance,
+    decode_journal,
+    decode_provenance,
+)
 from .viewer_tags import TAGS, classify_entry
-
-
-MAX_METADATA_BYTES = 64 * 1024
-MAX_METADATA_LINE_BYTES = 16 * 1024
-MAX_JOURNAL_BYTES = 8 * 1024 * 1024
-MAX_PROVENANCE_BYTES = 32 * 1024 * 1024
 
 
 class CatalogError(RuntimeError):
@@ -113,73 +112,20 @@ def _safe_relative(path: Path, root: Path) -> str:
         return path.name
 
 
-def _read_front_matter(path: Path) -> dict[str, object]:
-    metadata: dict[str, object] = {}
-    consumed = 0
-    try:
-        with path.open("rb") as handle:
-            opening = handle.readline(MAX_METADATA_LINE_BYTES + 1)
-            consumed += len(opening)
-            if opening != b"---\n":
-                raise CatalogError("missing opening metadata delimiter")
-            while consumed <= MAX_METADATA_BYTES:
-                raw = handle.readline(MAX_METADATA_LINE_BYTES + 1)
-                consumed += len(raw)
-                if not raw:
-                    raise CatalogError("missing closing metadata delimiter")
-                if len(raw) > MAX_METADATA_LINE_BYTES:
-                    raise CatalogError("metadata line exceeds size limit")
-                if raw in {b"---\n", b"---"}:
-                    return metadata
-                try:
-                    line = raw.decode("utf-8").rstrip("\n")
-                except UnicodeDecodeError as exc:
-                    raise CatalogError("metadata is not valid UTF-8") from exc
-                if ": " not in line:
-                    raise CatalogError("malformed metadata line")
-                key, encoded = line.split(": ", 1)
-                try:
-                    metadata[key] = json.loads(encoded)
-                except json.JSONDecodeError as exc:
-                    raise CatalogError(f"malformed metadata value: {key}") from exc
-    except OSError as exc:
-        raise CatalogError(f"cannot read generated journal: {exc.strerror or type(exc).__name__}") from exc
-    raise CatalogError("metadata exceeds size limit")
+def _require_journal(decoded: DecodedJournal) -> DecodedJournal:
+    if decoded.findings:
+        raise CatalogError(decoded.findings[0].message)
+    if decoded.metadata is None:
+        raise CatalogError("generated journal metadata is unavailable")
+    return decoded
 
 
-def _required_string(metadata: dict[str, object], key: str) -> str:
-    value = metadata.get(key)
-    if not isinstance(value, str) or not value:
-        raise CatalogError(f"missing or invalid metadata: {key}")
-    return value
-
-
-def _optional_string(metadata: dict[str, object], key: str) -> str | None:
-    value = metadata.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise CatalogError(f"invalid metadata: {key}")
-    return value
-
-
-def _nonnegative_int(metadata: dict[str, object], key: str) -> int:
-    value = metadata.get(key)
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise CatalogError(f"missing or invalid metadata: {key}")
-    return value
-
-
-def _read_bounded_text(path: Path, limit: int, label: str) -> str:
-    try:
-        size = path.stat().st_size
-        if size > limit:
-            raise CatalogError(f"{label} exceeds size limit")
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise CatalogError(f"{label} is not valid UTF-8") from exc
-    except OSError as exc:
-        raise CatalogError(f"cannot read {label}: {exc.strerror or type(exc).__name__}") from exc
+def _require_provenance(decoded: DecodedProvenance) -> DecodedProvenance:
+    if decoded.findings:
+        raise CatalogError(decoded.findings[0].message)
+    if decoded.artifact is None:
+        raise CatalogError("provenance companion is unavailable")
+    return decoded
 
 
 class JournalCatalog:
@@ -224,33 +170,30 @@ class JournalCatalog:
             relative = _safe_relative(journal, self.repo_root)
             try:
                 journal.resolve().relative_to(self.journal_root)
-                metadata = _read_front_matter(journal)
-                if metadata.get("generated_by") != "codex-journal" or metadata.get("format_version") != 1:
-                    raise CatalogError("unsupported generated journal format")
-                session_id = _required_string(metadata, "session_id")
+                decoded = _require_journal(decode_journal(journal))
+                metadata = decoded.metadata
+                assert metadata is not None
+                session_id = metadata.session_id
                 if session_id in sessions:
                     raise CatalogError(f"duplicate generated session ID: {session_id}")
-                status = _required_string(metadata, "status")
-                if status not in {"active", "completed", "incomplete"}:
-                    raise CatalogError("invalid metadata: status")
                 provenance = journal.with_suffix(".provenance.json")
                 if not provenance.is_file():
                     raise CatalogError("missing provenance companion")
                 sessions[session_id] = CatalogSession(
                     session_id=session_id,
-                    parent_session_id=_optional_string(metadata, "parent_session_id"),
-                    status=status,
-                    started_at_utc=_required_string(metadata, "started_at_utc"),
-                    ended_at_utc=_optional_string(metadata, "ended_at_utc"),
-                    rendered_timezone=_required_string(metadata, "rendered_timezone"),
-                    working_directory=_optional_string(metadata, "working_directory"),
-                    repository=_optional_string(metadata, "repository"),
-                    branch=_optional_string(metadata, "branch"),
-                    source_kind=str(metadata.get("source_kind") or "unknown"),
-                    source_fingerprint=_required_string(metadata, "source_fingerprint"),
-                    entry_count=_nonnegative_int(metadata, "timeline_entries"),
-                    redaction_count=_nonnegative_int(metadata, "redactions"),
-                    extraction_error_count=_nonnegative_int(metadata, "extraction_errors"),
+                    parent_session_id=metadata.parent_session_id,
+                    status=metadata.status,
+                    started_at_utc=metadata.started_at_utc,
+                    ended_at_utc=metadata.ended_at_utc,
+                    rendered_timezone=metadata.rendered_timezone,
+                    working_directory=metadata.working_directory,
+                    repository=metadata.repository,
+                    branch=metadata.branch,
+                    source_kind=metadata.source_kind,
+                    source_fingerprint=metadata.source_fingerprint,
+                    entry_count=metadata.timeline_entries,
+                    redaction_count=metadata.redactions,
+                    extraction_error_count=metadata.extraction_errors,
                     journal_path=journal.resolve(),
                     provenance_path=provenance.resolve(),
                 )
@@ -283,74 +226,40 @@ class JournalCatalog:
         cached = self._details.get(session_id) if cache else None
         if cached and cached[0] == session.source_fingerprint:
             return cached[1]
-        journal_text = _read_bounded_text(session.journal_path, self.max_journal_bytes, "generated journal")
-        provenance_text = _read_bounded_text(
-            session.provenance_path, self.max_provenance_bytes, "provenance companion"
+        journal = _require_journal(
+            decode_journal(session.journal_path, max_journal_bytes=self.max_journal_bytes)
         )
-        timeline: list[tuple[str, str]] = []
-        in_timeline = False
-        for line in journal_text.splitlines():
-            if line == "## Timeline":
-                in_timeline = True
-                continue
-            if in_timeline and line.startswith("## "):
-                break
-            if in_timeline and len(line) >= 8 and line[2] == ":" and line[5:7] == "  ":
-                timeline.append((line[:5], line[7:]))
-        try:
-            provenance = json.loads(provenance_text)
-        except json.JSONDecodeError as exc:
-            raise CatalogError("provenance companion is malformed JSON") from exc
-        if not isinstance(provenance, dict):
-            raise CatalogError("provenance companion has invalid structure")
-        if provenance.get("generated_by") != "codex-journal" or provenance.get("format_version") != 1:
-            raise CatalogError("unsupported provenance format")
-        if provenance.get("session_id") != session.session_id:
+        decoded_provenance = _require_provenance(
+            decode_provenance(
+                session.provenance_path,
+                max_provenance_bytes=self.max_provenance_bytes,
+            )
+        )
+        provenance = decoded_provenance.artifact
+        assert provenance is not None
+        if provenance.session_id != session.session_id:
             raise CatalogError("provenance session ID mismatch")
-        raw_entries = provenance.get("entries")
-        if not isinstance(raw_entries, list) or len(raw_entries) != len(timeline):
+        if len(provenance.entries) != len(journal.timeline):
             raise CatalogError("timeline and provenance entry counts differ")
         entries: list[CatalogEntry] = []
-        for index, (display_time, text) in enumerate(timeline):
-            raw = raw_entries[index]
-            if not isinstance(raw, dict) or raw.get("normalized_text") != text:
+        for index, (timeline, source) in enumerate(zip(journal.timeline, provenance.entries)):
+            if source.normalized_text != timeline.text:
                 raise CatalogError("timeline and provenance text differ")
-            sequence = raw.get("source_event_sequence")
-            timestamp = raw.get("original_timestamp_utc")
-            text_hash = raw.get("original_text_sha256")
-            redacted = raw.get("redacted")
-            if (
-                not isinstance(sequence, int)
-                or isinstance(sequence, bool)
-                or not isinstance(timestamp, str)
-                or not isinstance(text_hash, str)
-                or not isinstance(redacted, bool)
-            ):
-                raise CatalogError("provenance entry has invalid fields")
             entries.append(
                 CatalogEntry(
                     index=index,
-                    display_time=display_time,
-                    text=text,
-                    source_event_sequence=sequence,
-                    original_timestamp_utc=timestamp,
-                    original_text_sha256=text_hash,
-                    redacted=redacted,
+                    display_time=timeline.display_time,
+                    text=timeline.text,
+                    source_event_sequence=source.source_event_sequence,
+                    original_timestamp_utc=source.original_timestamp_utc,
+                    original_text_sha256=source.original_text_sha256,
+                    redacted=source.redacted,
                 )
             )
-        raw_errors = provenance.get("extraction_errors", [])
-        if not isinstance(raw_errors, list):
-            raise CatalogError("provenance extraction errors have invalid structure")
-        extraction_errors: list[CatalogExtractionError] = []
-        for raw in raw_errors:
-            if not isinstance(raw, dict):
-                raise CatalogError("provenance extraction error has invalid fields")
-            sequence = raw.get("sequence")
-            code = raw.get("code")
-            detail = raw.get("detail", "")
-            if not isinstance(sequence, int) or not isinstance(code, str) or not isinstance(detail, str):
-                raise CatalogError("provenance extraction error has invalid fields")
-            extraction_errors.append(CatalogExtractionError(sequence, code, detail))
+        extraction_errors = [
+            CatalogExtractionError(error.sequence, error.code, error.detail)
+            for error in provenance.extraction_errors
+        ]
         detail = CatalogDetail(session, tuple(entries), tuple(extraction_errors))
         if cache:
             self._details[session_id] = (session.source_fingerprint, detail)

@@ -10,12 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from codex_journal.artifacts import decode_journal
 from codex_journal.compact import compact_candidates
 from codex_journal.engine import JournalEngine
 from codex_journal.model import Candidate, ExtractionOutcome
 from codex_journal.parser import duplicate_session_ids, extract_session
 from codex_journal.redact import redact_text, shorten_home
-from codex_journal.render import atomic_write, parse_front_matter
+from codex_journal.render import atomic_write
 from codex_journal.state import read_all_readonly
 from codex_journal.viewer import ViewerUnavailable, load_gtk
 
@@ -90,8 +91,8 @@ class JournalTestCase(unittest.TestCase):
 
     def journal_for(self, session_id: str) -> Path:
         for path in (self.repo / "journal").rglob("*.md"):
-            metadata, _ = parse_front_matter(path)
-            if metadata.get("session_id") == session_id:
+            metadata = decode_journal(path).metadata
+            if metadata is not None and metadata.session_id == session_id:
                 return path
         self.fail(f"journal not found for {session_id}")
 
@@ -115,10 +116,11 @@ class ExtractionTests(JournalTestCase):
         result = self.engine.sync(timezone_name="Europe/Zurich")
         self.assertEqual(result.processed, 1)
         journal = self.journal_for("11111111-1111-4111-8111-111111111111")
-        metadata, errors = parse_front_matter(journal)
-        self.assertFalse(errors)
-        self.assertEqual(metadata["status"], "completed")
-        self.assertEqual(metadata["ended_at_utc"], "2026-08-31T13:15:01Z")
+        decoded = decode_journal(journal)
+        self.assertFalse(decoded.findings)
+        assert decoded.metadata is not None
+        self.assertEqual(decoded.metadata.status, "completed")
+        self.assertEqual(decoded.metadata.ended_at_utc, "2026-08-31T13:15:01Z")
         self.assertEqual(self.timeline(journal), ["Reviewing #35 hostile profile contract.", "Found two review blockers."])
         self.assertFalse(self.engine.verify().errors)
 
@@ -127,14 +129,14 @@ class ExtractionTests(JournalTestCase):
         first = self.engine.sync(timezone_name="Europe/Zurich")
         self.assertEqual(first.rebuilt, 1)
         journal = self.journal_for("22222222-2222-4222-8222-222222222222")
-        self.assertEqual(parse_front_matter(journal)[0]["status"], "active")
+        self.assertEqual(decode_journal(journal).metadata.status, "active")
         with source.open("a", encoding="utf-8") as output:
             output.write(json_line(commentary("Completed append-only validation.", "2026-08-31T10:01:00Z")))
             output.write(json_line(lifecycle("task_complete", "2026-08-31T10:01:01Z")))
         second = self.engine.sync(timezone_name="Europe/Zurich")
         self.assertEqual(second.appended, 1)
         self.assertIn("Completed append-only validation.", self.timeline(journal))
-        self.assertEqual(parse_front_matter(journal)[0]["status"], "completed")
+        self.assertEqual(decode_journal(journal).metadata.status, "completed")
 
     def test_02b_extraction_outcome_is_structured_for_each_mode(self) -> None:
         source_path = self.fixture("active_append.jsonl")
@@ -164,8 +166,9 @@ class ExtractionTests(JournalTestCase):
         self.engine.sync(timezone_name="Europe/Zurich")
         child = self.journal_for("33333333-3333-4333-8333-333333333333")
         parent = self.journal_for("11111111-1111-4111-8111-111111111111")
-        metadata, _ = parse_front_matter(child)
-        self.assertEqual(metadata["parent_session_id"], "11111111-1111-4111-8111-111111111111")
+        metadata = decode_journal(child).metadata
+        assert metadata is not None
+        self.assertEqual(metadata.parent_session_id, "11111111-1111-4111-8111-111111111111")
         self.assertIn("Parent:", child.read_text(encoding="utf-8"))
         self.assertIn("Child:", parent.read_text(encoding="utf-8"))
         self.assertNotIn("PRIVATE INTER-AGENT", child.read_text(encoding="utf-8"))
