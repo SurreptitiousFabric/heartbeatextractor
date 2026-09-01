@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .atomic import atomic_replace
 from .viewer_catalog import JournalCatalog, JournalSearchIndex
 
 
@@ -102,21 +101,8 @@ def compare_snapshots(before: CatalogSnapshot, after: CatalogSnapshot) -> Change
 def rebuild_search_index_atomic(catalog: JournalCatalog, destination: Path) -> int:
     """Build local search state beside its destination, then atomically replace it."""
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp", delete=False
-        ) as handle:
-            temporary = Path(handle.name)
+    def rebuild(temporary: Path) -> int:
         with JournalSearchIndex(temporary) as index:
-            count = index.rebuild(catalog)
-        os.replace(temporary, destination)
-        temporary = None
-        return count
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+            return index.rebuild(catalog)
+
+    return atomic_replace(destination, rebuild)

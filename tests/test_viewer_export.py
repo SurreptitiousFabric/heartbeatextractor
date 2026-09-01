@@ -120,7 +120,7 @@ class ViewerExportTests(unittest.TestCase):
     def test_atomic_write_requires_absolute_destination_and_overwrite_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "export.md"
-            with patch("codex_journal.viewer_export.os.replace", wraps=os.replace) as replace:
+            with patch("codex_journal.atomic.os.replace", wraps=os.replace) as replace:
                 write_export_atomic(destination, b"first\n")
             replace.assert_called_once()
             self.assertEqual(destination.read_bytes(), b"first\n")
@@ -134,7 +134,7 @@ class ViewerExportTests(unittest.TestCase):
     def test_write_failure_leaves_no_partial_target_or_temporary_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "export.json"
-            with patch("codex_journal.viewer_export.os.replace", side_effect=OSError("failure")):
+            with patch("codex_journal.atomic.os.replace", side_effect=OSError("failure")):
                 with self.assertRaises(OSError):
                     write_export_atomic(destination, b"content")
             self.assertFalse(destination.exists())

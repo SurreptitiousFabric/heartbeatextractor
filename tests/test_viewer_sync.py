@@ -61,7 +61,7 @@ class ViewerSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "state" / "viewer.sqlite3"
             with patch("codex_journal.viewer_sync.JournalSearchIndex") as index_class, patch(
-                "codex_journal.viewer_sync.os.replace", wraps=os.replace
+                "codex_journal.atomic.os.replace", wraps=os.replace
             ) as replace:
                 index_class.return_value.__enter__.return_value.rebuild.return_value = 42
                 count = rebuild_search_index_atomic(catalog, destination)

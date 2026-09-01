@@ -300,7 +300,7 @@ class TimeAndRobustnessTests(JournalTestCase):
     def test_15_atomic_output_replacement(self) -> None:
         target = self.repo / "atomic.md"
         real_replace = os.replace
-        with mock.patch("codex_journal.render.os.replace", wraps=real_replace) as replacement:
+        with mock.patch("codex_journal.atomic.os.replace", wraps=real_replace) as replacement:
             changed = atomic_write(target, b"new content\n")
         self.assertTrue(changed)
         replacement.assert_called_once()

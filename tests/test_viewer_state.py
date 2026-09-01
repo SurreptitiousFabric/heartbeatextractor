@@ -65,7 +65,7 @@ class ViewerStateTests(unittest.TestCase):
         self.assertEqual(loaded.timeline_density, "comfortable")
 
     def test_save_uses_atomic_replace(self) -> None:
-        with patch("codex_journal.viewer_state.os.replace", wraps=__import__("os").replace) as replace:
+        with patch("codex_journal.atomic.os.replace", wraps=__import__("os").replace) as replace:
             self.store.save(ViewerState())
         replace.assert_called_once()
         self.assertEqual(replace.call_args.args[1], self.path)

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .atomic import atomic_write_bytes
 
 
 MAX_VIEWER_STATE_BYTES = 256 * 1024
@@ -123,20 +123,4 @@ class ViewerStateStore:
         encoded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
         if len(encoded) > MAX_VIEWER_STATE_BYTES:
             raise ValueError("viewer state exceeds size limit")
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb", dir=self.path.parent, prefix=f".{self.path.name}.", delete=False
-            ) as handle:
-                temporary = Path(handle.name)
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-            temporary = None
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
+        atomic_write_bytes(self.path, encoded)

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from .atomic import atomic_write_bytes
 from .viewer_activity import ActivityReport
 from .viewer_annotations import AnnotationStore, AnnotationTarget
 from .viewer_catalog import CatalogDetail, CatalogEntry
@@ -232,23 +231,7 @@ def write_export_atomic(destination: Path, content: bytes, *, overwrite: bool = 
         raise ValueError("Refusing to replace a symbolic-link export target.")
     if target.exists() and not overwrite:
         raise FileExistsError("Export destination already exists.")
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", dir=parent, prefix=f".{target.name}.", suffix=".tmp", delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        temporary = None
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+    atomic_write_bytes(target, content)
 
 
 def _session(detail: CatalogDetail) -> ExportSession:

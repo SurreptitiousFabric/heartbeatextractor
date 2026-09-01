@@ -4,11 +4,11 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .atomic import atomic_write_bytes
 from .compact import compact_candidates
 from .model import JournalEntry, SessionCache
 from .parser import parse_timestamp, project_slug, project_title
@@ -52,19 +52,7 @@ def atomic_write(path: Path, data: bytes) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_bytes() == data:
         return False
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as temporary:
-            temporary.write(data)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
+    atomic_write_bytes(path, data)
     return True
 
 
