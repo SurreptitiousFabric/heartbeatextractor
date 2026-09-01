@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .viewer_catalog import CatalogSession, JournalCatalog, SearchHit
 
@@ -163,12 +164,16 @@ class SessionBrowserModel:
 
 
 def display_start(session: CatalogSession) -> str:
-    """Return the stable date/time label carried by generated metadata."""
+    """Render a session start in the same timezone as its generated timeline."""
 
     try:
         parsed = datetime.fromisoformat(session.started_at_utc.replace("Z", "+00:00"))
-        return f"{session.local_date}  {parsed:%H:%M} UTC"
-    except ValueError:
+        if parsed.tzinfo is None:
+            raise ValueError("session start has no timezone")
+        local = parsed.astimezone(ZoneInfo(session.rendered_timezone))
+        zone_label = local.tzname() or session.rendered_timezone
+        return f"{local:%Y-%m-%d  %H:%M} {zone_label}"
+    except (ValueError, ZoneInfoNotFoundError):
         return f"{session.local_date}  time unavailable"
 
 

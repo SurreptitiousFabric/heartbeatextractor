@@ -53,8 +53,9 @@ details lazily. It rejects malformed, oversized, duplicate, unsupported, or
 unknown data. It never imports or calls the raw parser.
 
 The FTS5 index in ignored `state/viewer.sqlite3` contains only generated safe
-entry text and safe metadata. It can be rebuilt atomically. Private notes and
-raw source fields are not indexed.
+entry text and safe metadata. It also supplies the bounded first-entry summary
+shown in each session row, avoiding raw-log access. It can be rebuilt
+atomically. Private notes and raw source fields are not indexed.
 
 `viewer_tags.py` adds mechanical labels for failure, test, security, blocker,
 correction, commit, issue/PR, stop, and filename patterns. Tags do not rewrite
@@ -64,7 +65,8 @@ or infer meaning.
 
 `viewer_model.py` composes deterministic filters and selection.
 `viewer_presenter.py` converts stored event timestamps into the journal's
-recorded timezone and prepares date groups and visible indicators.
+recorded timezone, bounds session summaries, escapes inline-code markup, and
+prepares date groups and visible indicators.
 `viewer_ui.py` owns the adaptive GTK widgets and starts potentially expensive
 sync or activity work in background threads. UI callbacks receive safe counts
 or error types rather than raw exception payloads.
@@ -81,7 +83,7 @@ search, separate from journals, and excluded from export unless the person
 checks the explicit opt-in control.
 
 `viewer_state.py` stores only bounded selection, filter, window, entry index,
-and sync-summary values in ignored `state/viewer-state.json`. It deliberately
+timeline-density, and sync-summary values in ignored `state/viewer-state.json`. It deliberately
 does not store search queries or journal text.
 
 ### Local actions and export

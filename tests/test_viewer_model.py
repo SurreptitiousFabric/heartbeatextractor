@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from codex_journal.engine import JournalEngine
@@ -69,6 +70,17 @@ class ViewerModelTests(unittest.TestCase):
         self.assertIn(session.status, session_badges(session))
         subagent = next(item for item in self.model.sessions if item.source_kind == "subagent")
         self.assertIn("sub-agent", session_badges(subagent))
+
+    def test_session_start_uses_rendered_timezone_across_dst_fallback(self) -> None:
+        session = self.model.sessions[0]
+        before = replace(
+            session,
+            started_at_utc="2026-10-25T00:55:00Z",
+            rendered_timezone="Europe/Zurich",
+        )
+        after = replace(before, started_at_utc="2026-10-25T01:55:00Z")
+        self.assertEqual(display_start(before), "2026-10-25  02:55 CEST")
+        self.assertEqual(display_start(after), "2026-10-25  02:55 CET")
 
     def test_unknown_filter_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown browser filter"):

@@ -5,7 +5,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from codex_journal.viewer_catalog import CatalogDetail, CatalogEntry, CatalogSession
-from codex_journal.viewer_presenter import present_entry, present_timeline
+from codex_journal.viewer_presenter import (
+    concise_session_summary,
+    present_entry,
+    present_timeline,
+    safe_inline_markup,
+)
 from codex_journal.viewer_tags import classify_entry
 
 
@@ -78,6 +83,20 @@ class ViewerPresenterTests(unittest.TestCase):
         shown = present_entry(entry(0, "not-a-time", "Untimed display."), session())
         self.assertEqual(shown.local_date, "Unknown date")
         self.assertEqual(shown.display_time, "02:00")
+
+    def test_session_summary_is_whitespace_normalized_and_bounded(self) -> None:
+        summary = concise_session_summary("  Reviewing\n#35   hostile profile contract.  ")
+        self.assertEqual(summary, "Reviewing #35 hostile profile contract.")
+        bounded = concise_session_summary("word " * 100, limit=30)
+        self.assertLessEqual(len(bounded), 30)
+        self.assertTrue(bounded.endswith("…"))
+
+    def test_inline_code_markup_escapes_content_before_styling(self) -> None:
+        markup = safe_inline_markup("Opened `<unsafe>&` then `src/viewer.py`.")
+        self.assertIn("&lt;unsafe&gt;&amp;", markup)
+        self.assertIn('font_family="monospace"', markup)
+        self.assertNotIn("`", markup)
+        self.assertEqual(safe_inline_markup("Unbalanced `value"), "Unbalanced `value")
 
 
 if __name__ == "__main__":

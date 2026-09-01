@@ -9,6 +9,8 @@ from typing import Any
 
 
 MAX_VIEWER_STATE_BYTES = 256 * 1024
+
+
 @dataclass(frozen=True)
 class ViewerState:
     selected_session_id: str | None = None
@@ -17,6 +19,7 @@ class ViewerState:
     window_height: int = 760
     content_visible: bool = False
     timeline_entry_index: int = 0
+    timeline_density: str = "comfortable"
     last_sync_at: str | None = None
     last_sync_summary: str | None = None
 
@@ -93,6 +96,11 @@ class ViewerStateStore:
             window_height=_bounded_dimension(payload.get("window_height"), 760),
             content_visible=_strict_bool(payload.get("content_visible", False)),
             timeline_entry_index=entry_index,
+            timeline_density=(
+                payload.get("timeline_density")
+                if payload.get("timeline_density") in {"comfortable", "compact"}
+                else "comfortable"
+            ),
             last_sync_at=(
                 payload.get("last_sync_at")
                 if isinstance(payload.get("last_sync_at"), str)

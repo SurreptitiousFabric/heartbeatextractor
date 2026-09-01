@@ -10,6 +10,7 @@ from pathlib import Path
 
 from codex_journal.engine import JournalEngine
 from codex_journal.viewer import ViewerUnavailable, load_gtk
+from codex_journal.viewer_tags import classify_entry
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -125,6 +126,62 @@ class ViewerGtkTests(unittest.TestCase):
         window._compare_recent()
         self.assertIsNotNone(window._comparison_report)
         self.assertEqual(len(window._recent_session_ids), 2)
+
+    def test_reworked_navigation_exposes_context_filters_and_reliable_help(self) -> None:
+        self._fixture("normal_completed.jsonl")
+        self._generate()
+        window = self._open()
+        session = window.model.selected
+        self.assertIsNotNone(session)
+        self.assertEqual(window.shortcuts_button.get_label(), "Keyboard shortcuts")
+        self.assertGreaterEqual(window.more_actions_button.get_menu_model().get_n_items(), 6)
+        self.assertEqual(window.main_title.get_title(), session.project)
+        self.assertIn("Europe/Zurich", session.rendered_timezone)
+        self.assertIn("Displaying 1 generated journal", window.sync_status.get_label())
+        self.assertTrue(window._session_summaries[session.session_id])
+
+        project_filter = window._filter_widgets["project"]
+        project_filter.set_selected(1)
+        self._drain()
+        self.assertTrue(window.clear_filters_button.get_visible())
+        self.assertIn("active filter", window.filter_status.get_label())
+        window._clear_filters()
+        self.assertEqual(project_filter.get_selected(), 0)
+        self.assertFalse(window.clear_filters_button.get_visible())
+
+    def test_selection_density_and_provenance_behaviors_are_explicit(self) -> None:
+        self._fixture("normal_completed.jsonl")
+        self._generate()
+        window = self._open()
+        self.assertTrue(window._timeline_widgets)
+        first_index = min(window._timeline_widgets)
+        first_row = window._timeline_widgets[first_index]
+        first_check = window._selection_checks[first_index]
+        self.assertFalse(first_row.get_expanded())
+        self.assertFalse(first_check.get_visible())
+
+        window._set_selection_mode(True)
+        self.assertTrue(window.selection_bar.get_reveal_child())
+        self.assertTrue(first_check.get_visible())
+        first_check.set_active(True)
+        self._drain()
+        self.assertEqual(window.selection_count.get_label(), "1 selected")
+        self.assertTrue(window.copy_selection_button.get_sensitive())
+        window._set_selection_mode(False)
+        self.assertFalse(first_check.get_visible())
+        self.assertEqual(window.selection_count.get_label(), "0 selected")
+
+        window.density_dropdown.set_selected(1)
+        self._drain()
+        compact_row = window._timeline_widgets[min(window._timeline_widgets)]
+        self.assertEqual(compact_row.get_label_widget().get_margin_top(), 5)
+        tagged_index = next(
+            entry.index for entry in window.current_detail.entries if classify_entry(entry.text)
+        )
+        tagged_body = window._timeline_widgets[tagged_index].get_label_widget().get_last_child()
+        self.assertIsInstance(tagged_body.get_last_child(), Gtk.FlowBox)
+        window._move_entry(1)
+        self.assertFalse(window._timeline_widgets[window.current_entry_index].get_expanded())
 
     def test_empty_and_malformed_generated_states_are_intentional(self) -> None:
         (self.repo / "journal").mkdir(parents=True)

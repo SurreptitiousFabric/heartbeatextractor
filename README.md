@@ -71,18 +71,20 @@ are opened read-only and are never copied into this repository.
 Run `mise exec -- codex-journal view`. The adaptive GTK4/libadwaita interface
 provides:
 
-- project, date, branch, lifecycle, source, bookmark, redaction, extraction
-  error, and deterministic tag filters;
+- common project/status filters, a disclosed advanced filter panel, active-filter
+  feedback, and one-step reset;
 - local full-text search across generated journal entries only;
-- timestamped timelines with expandable provenance and session metadata;
+- distinguishing session summaries and a persistent current-session header;
+- compact or comfortable timestamped timelines with semantic badges, safe
+  inline-code styling, and explicitly expandable provenance;
 - keyboard-first previous/next session and entry navigation;
 - parent/sub-agent links, bookmarks, private notes, exact session comparison,
   and daily/weekly/project activity views;
 - manual sync, optional Sync on launch, optional five-minute refresh while the
   window is open, and exact change summaries;
-- validated project-directory opening, reviewed copy actions, and atomic
+- explicit range-selection mode, validated project-directory opening, reviewed copy actions, and atomic
   Markdown or JSON export with private notes excluded by default; and
-- remembered window, filter, selection, timeline, theme, and sync-summary
+- remembered window, filter, timeline position, density, theme, and sync-summary
   state.
 
 The viewer reads generated journals and provenance, never rollout JSONL. See

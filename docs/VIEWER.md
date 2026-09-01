@@ -12,27 +12,35 @@ extractor in-process, update journals atomically, rebuild safe search, and show
 counts for new sessions, entries, lifecycle changes, and extraction errors.
 The timeline remains usable while sync runs.
 
-The sidebar offers two opt-in modes:
+The viewer-preferences menu offers two opt-in modes:
 
 - **Sync on launch** runs one sync after the initial generated catalog appears.
 - **Sync every 5 minutes while open** schedules in-process sync only while the
   window exists. This is not a daemon and does not survive application exit.
 
-The last successful time and change summary are remembered locally.
+The status distinguishes journals currently displayed from syncs started by
+the viewer. It never claims that source sessions are fresh merely because
+generated journals exist. The last successful viewer-sync time and change
+summary are remembered locally.
 
 ## Browse and search
 
 Sessions are newest first and show project, local start, branch, lifecycle,
-source kind, entry count, and warning indicators. Combine full-text search with
-project, from/to date, branch, lifecycle status, source kind, bookmark,
-redaction, extraction-error, and deterministic tag filters.
+source kind, entry count, warning indicators, and a bounded summary from the
+first sanitized journal entry. Project and status stay visible; date, branch,
+source, tag, redaction, and extraction-error filters live under **Advanced
+filters**. Active constraints are counted and **Clear all** resets them in one
+step.
 
 Search indexes generated normalized entries only. The deterministic tags are:
 `failure`, `test`, `security`, `blocker`, `correction`, `commit`, `issue/PR`,
 `stop`, and `filename`. They are regex classifications, not model judgments.
 
-Selecting a session opens its timeline. Entries retain their exact stored UTC
-timestamp and render in the journal's recorded timezone. Expand an entry to see
+Selecting a session opens its timeline and keeps the project, local start,
+timezone, branch, and lifecycle visible in the header while scrolling. Entries
+retain their exact stored UTC timestamp and render in the journal's recorded
+timezone. Choose Comfortable or Compact density in viewer preferences. Inline
+code is escaped before receiving monospace styling. Expand an entry to see
 its source sequence, original UTC timestamp, original-text SHA-256, normalized
 text, and redaction flag. Session details show lifecycle, working directory,
 repository, branch, source kind, relation IDs, counts, and source fingerprint.
@@ -72,10 +80,11 @@ Open Project resolves the recorded working directory and permits it only when
 it is an existing directory beneath the current user's home without a symlink
 escape.
 
-Copy Entry copies one rendered timestamp plus sanitized entry text. Check
-timeline rows to copy either the checked entries or the inclusive range between
-the first and last check. These actions never copy provenance hashes, raw
-source fields, private notes, or tool output.
+Copy Entry copies one rendered timestamp plus sanitized entry text. Choose
+**Select** to reveal range controls, select entries, review the contextual
+count, and copy the selected entries or inclusive range. Cancel leaves no
+selection behind. These actions never copy provenance hashes, raw source
+fields, private notes, or tool output.
 
 Export supports the current entry, checked entries, checked time range, latest
 comparison, or current activity view. Choose Markdown or JSON, inspect the
@@ -95,7 +104,8 @@ is atomic. Every export includes a private-information warning.
 | `Ctrl+R` | Sync source sessions in-process |
 | `Ctrl+O` | Open validated project directory |
 | `Ctrl+Alt+C` | Copy current sanitized entry |
-| `Ctrl+Alt+Shift+C` | Copy checked entries/range |
+| `Ctrl+Shift+S` | Enter explicit timeline selection mode |
+| `Ctrl+Alt+Shift+C` | Copy selected entries/range, or enter selection mode |
 | `Ctrl+B` | Bookmark current entry |
 | `Ctrl+Shift+B` | Bookmark current session |
 | `Ctrl+D` | Toggle session details |
@@ -110,8 +120,9 @@ search field, or private-note editor owns focus so normal text editing wins.
 
 ## Accessibility
 
-The application uses native GTK controls, semantic headings, selectable text,
-visible keyboard focus, tooltips, accessible labels for icon-only controls,
+The application uses native GTK controls, semantic headings and text badges,
+selectable text, visible keyboard focus, tooltips, accessible labels for
+icon-only controls, an explicitly labeled keyboard-help button,
 system/light/dark color schemes, and an adaptive split view. The sidebar
 collapses on narrow windows and exposes a Back button. Status pages distinguish
 loading, empty, unselected, and malformed states without depending on color

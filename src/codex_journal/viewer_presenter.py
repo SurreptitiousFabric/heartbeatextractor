@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import html
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .viewer_catalog import CatalogDetail, CatalogEntry, CatalogSession
 from .viewer_tags import classify_entry
+
+
+MAX_SESSION_SUMMARY_CHARS = 120
+_INLINE_CODE = re.compile(r"`([^`\n]+)`")
 
 
 @dataclass(frozen=True)
@@ -46,3 +52,30 @@ def present_entry(entry: CatalogEntry, session: CatalogSession) -> PresentedEntr
 
 def present_timeline(detail: CatalogDetail) -> tuple[PresentedEntry, ...]:
     return tuple(present_entry(entry, detail.session) for entry in detail.entries)
+
+
+def concise_session_summary(text: str, limit: int = MAX_SESSION_SUMMARY_CHARS) -> str:
+    """Bound one already-sanitized timeline entry for session-list display."""
+
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    shortened = cleaned[: max(1, limit - 1)].rstrip()
+    if " " in shortened:
+        shortened = shortened.rsplit(" ", 1)[0]
+    return f"{shortened}…"
+
+
+def safe_inline_markup(text: str) -> str:
+    """Render balanced inline-code spans after escaping every source character."""
+
+    if text.count("`") % 2 or "\n" in text:
+        return html.escape(text)
+    parts: list[str] = []
+    cursor = 0
+    for match in _INLINE_CODE.finditer(text):
+        parts.append(html.escape(text[cursor : match.start()]))
+        parts.append(f'<span font_family="monospace">{html.escape(match.group(1))}</span>')
+        cursor = match.end()
+    parts.append(html.escape(text[cursor:]))
+    return "".join(parts)

@@ -70,6 +70,15 @@ class ViewerCatalogTests(unittest.TestCase):
             self.assertFalse(index.search(raw_secret))
         self.assertNotIn(raw_secret.encode(), database.read_bytes())
 
+    def test_session_summaries_use_first_sanitized_indexed_entry(self) -> None:
+        with JournalSearchIndex(self.root / "summary.sqlite3") as index:
+            index.rebuild(self.catalog)
+            summaries = index.session_summaries()
+        for session in self.catalog.sessions:
+            detail = self.catalog.load_detail(session.session_id)
+            if detail.entries:
+                self.assertEqual(summaries[session.session_id], detail.entries[0].text)
+
     def test_search_filters_safe_metadata_tags_and_flags(self) -> None:
         database = self.repo / "state" / "viewer.sqlite3"
         session = self.catalog.sessions[0]

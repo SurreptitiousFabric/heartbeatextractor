@@ -447,6 +447,22 @@ class JournalSearchIndex:
                     count += len(rows)
         return count
 
+    def session_summaries(self) -> dict[str, str]:
+        """Return each session's first sanitized journal entry."""
+
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT session_id, text
+                FROM journal_search
+                WHERE entry_index = 0
+                ORDER BY session_id
+                """
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise CatalogError("viewer session summaries are unavailable") from exc
+        return {str(session_id): str(text) for session_id, text in rows}
+
     def search(
         self,
         query: str,

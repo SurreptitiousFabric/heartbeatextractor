@@ -37,8 +37,13 @@ from .viewer_export import (
     selected_entries_document,
     write_export_atomic,
 )
-from .viewer_model import ALL, SessionBrowserModel, display_start, session_badges
-from .viewer_presenter import PresentedEntry, present_timeline
+from .viewer_model import ALL, BrowserFilters, SessionBrowserModel, display_start, session_badges
+from .viewer_presenter import (
+    PresentedEntry,
+    concise_session_summary,
+    present_timeline,
+    safe_inline_markup,
+)
 from .viewer_tags import TAGS
 from .viewer_state import ViewerState, ViewerStateStore
 from .viewer_sync import (
@@ -79,8 +84,12 @@ class JournalWindow:
         self.last_sync_at = self.saved_state.last_sync_at
         self.last_sync_summary = self.saved_state.last_sync_summary
         self.current_entry_index = self.saved_state.timeline_entry_index
+        self.timeline_density = self.saved_state.timeline_density
         self._state_restored = False
         self._timeline_widgets: dict[int, object] = {}
+        self._selection_checks: dict[int, object] = {}
+        self.selection_mode = False
+        self._updating_selection = False
         self.details_expander: object | None = None
         self.current_detail: object | None = None
         self._selected_entry_indexes: set[int] = set()
@@ -95,8 +104,10 @@ class JournalWindow:
         self._session_rows: dict[object, str] = {}
         self._filter_widgets: dict[str, object] = {}
         self._hits_by_session: dict[str, SearchHit] = {}
+        self._session_summaries: dict[str, str] = {}
         self.search_index: JournalSearchIndex | None = None
         self._loading = False
+        self._updating_filters = False
         self._sync_running = False
         self._closed = False
         self._periodic_source: int | None = None
@@ -158,6 +169,7 @@ class JournalWindow:
             ("sync", lambda *_args: self._start_sync(), ("<Ctrl>r",)),
             ("open-project", lambda *_args: self._open_project(), ("<Ctrl>o",)),
             ("copy-entry", lambda *_args: self._copy_current_entry(), ("<Ctrl><Alt>c",)),
+            ("selection-mode", lambda *_args: self._set_selection_mode(True), ("<Ctrl><Shift>s",)),
             (
                 "copy-range",
                 lambda *_args: self._copy_selected_range(),
@@ -232,9 +244,19 @@ class JournalWindow:
         except ValueError:
             current = 0
         index = indexes[max(0, min(len(indexes) - 1, current + delta))]
+        self._focus_entry(index)
+
+    def _focus_entry(self, index: int) -> None:
+        widget = self._timeline_widgets.get(index)
+        if widget is None:
+            return
+        for candidate_index, candidate in self._timeline_widgets.items():
+            if candidate_index == index:
+                candidate.add_css_class("accent")
+            else:
+                candidate.remove_css_class("accent")
         self.current_entry_index = index
-        widget = self._timeline_widgets[index]
-        widget.set_expanded(True)
+        self._load_entry_note()
         widget.grab_focus()
 
     def _toggle_details(self) -> None:
@@ -255,6 +277,12 @@ class JournalWindow:
         self.theme = choices[(choices.index(self.theme) + 1) % len(choices)]
         self._apply_theme()
 
+    def _on_density_changed(self, dropdown: object, _pspec: object) -> None:
+        self.timeline_density = "compact" if dropdown.get_selected() == 1 else "comfortable"
+        detail = self.current_detail
+        if detail is not None and self._state_restored:
+            self._render_session(detail.session.session_id)
+
     def _show_shortcuts(self) -> None:
         window = self.Gtk.ShortcutsWindow(transient_for=self.window, modal=True)
         window.set_title("Heartbeat Extractor shortcuts")
@@ -270,6 +298,7 @@ class JournalWindow:
             ("Sync source sessions", "<Ctrl>r"),
             ("Open validated project directory", "<Ctrl>o"),
             ("Copy current sanitized entry", "<Ctrl><Alt>c"),
+            ("Enter timeline selection mode", "<Ctrl><Shift>s"),
             ("Copy selected sanitized range", "<Ctrl><Alt><Shift>c"),
             ("Bookmark current entry", "<Ctrl>b"),
             ("Bookmark current session", "<Ctrl><Shift>b"),
@@ -292,20 +321,50 @@ class JournalWindow:
         header = self.Adw.HeaderBar()
         title = self.Adw.WindowTitle(title="Sessions", subtitle="Generated journals only")
         header.set_title_widget(title)
-        help_button = self.Gtk.Button(
-            icon_name="help-keyboard-shortcuts-symbolic",
-            tooltip_text="Keyboard shortcuts",
+        settings_button = self.Gtk.MenuButton(
+            icon_name="open-menu-symbolic", tooltip_text="Viewer preferences and help"
         )
-        self._accessible(help_button, "Show keyboard shortcuts")
-        help_button.connect("clicked", lambda *_args: self._show_shortcuts())
-        header.pack_end(help_button)
-        theme_button = self.Gtk.Button(
-            icon_name="weather-clear-night-symbolic",
-            tooltip_text="Cycle system, light, and dark themes",
+        self._accessible(settings_button, "Open viewer preferences and help")
+        preferences = self.Gtk.Popover()
+        preferences_box = self.Gtk.Box(
+            orientation=self.Gtk.Orientation.VERTICAL,
+            spacing=10,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
         )
-        self._accessible(theme_button, "Cycle color theme")
+        preference_heading = self.Gtk.Label(label="Viewer preferences", xalign=0)
+        preference_heading.add_css_class("heading")
+        preferences_box.append(preference_heading)
+        self.sync_on_launch_check = self.Gtk.CheckButton(label="Sync on launch")
+        self.sync_on_launch_check.connect("toggled", self._on_sync_setting_changed)
+        preferences_box.append(self.sync_on_launch_check)
+        self.periodic_sync_check = self.Gtk.CheckButton(
+            label="Sync every 5 minutes while open"
+        )
+        self.periodic_sync_check.connect("toggled", self._on_sync_setting_changed)
+        preferences_box.append(self.periodic_sync_check)
+        density_row = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=8)
+        density_row.append(self.Gtk.Label(label="Timeline density", xalign=0))
+        self.density_dropdown = self.Gtk.DropDown.new_from_strings(
+            ["Comfortable", "Compact"]
+        )
+        self.density_dropdown.set_selected(1 if self.timeline_density == "compact" else 0)
+        self.density_dropdown.connect("notify::selected", self._on_density_changed)
+        self._accessible(self.density_dropdown, "Choose timeline density")
+        density_row.append(self.density_dropdown)
+        preferences_box.append(density_row)
+        theme_button = self.Gtk.Button(label="Cycle color theme")
         theme_button.connect("clicked", lambda *_args: self._cycle_theme())
-        header.pack_end(theme_button)
+        preferences_box.append(theme_button)
+        self.shortcuts_button = self.Gtk.Button(label="Keyboard shortcuts")
+        self._accessible(self.shortcuts_button, "Show keyboard shortcuts")
+        self.shortcuts_button.connect("clicked", lambda *_args: self._show_shortcuts())
+        preferences_box.append(self.shortcuts_button)
+        preferences.set_child(preferences_box)
+        settings_button.set_popover(preferences)
+        header.pack_end(settings_button)
         self.sync_button = self.Gtk.Button(
             icon_name="view-refresh-symbolic", tooltip_text="Sync source sessions"
         )
@@ -332,14 +391,15 @@ class JournalWindow:
             margin_start=12,
             margin_end=12,
         )
-        for field, label in (
-            ("project", "Project"),
-            ("date_from", "From"),
-            ("date_to", "To"),
-            ("branch", "Branch"),
-            ("status", "Status"),
-            ("source_kind", "Source"),
-            ("tag", "Tag"),
+        advanced = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=8)
+        for field, label, destination in (
+            ("project", "Project", filters),
+            ("status", "Status", filters),
+            ("date_from", "From", advanced),
+            ("date_to", "To", advanced),
+            ("branch", "Branch", advanced),
+            ("source_kind", "Source", advanced),
+            ("tag", "Tag", advanced),
         ):
             row = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=8)
             caption = self.Gtk.Label(label=label, xalign=0)
@@ -351,30 +411,42 @@ class JournalWindow:
             self._filter_widgets[field] = dropdown
             row.append(caption)
             row.append(dropdown)
-            filters.append(row)
+            destination.append(row)
+        self.bookmarks_check = self.Gtk.CheckButton(label="Bookmarked sessions")
+        self.bookmarks_check.connect("toggled", self._on_boolean_filter, "bookmarked_only")
+        filters.append(self.bookmarks_check)
         self.redacted_check = self.Gtk.CheckButton(label="Has redactions")
         self.redacted_check.connect("toggled", self._on_boolean_filter, "redacted_only")
-        filters.append(self.redacted_check)
+        advanced.append(self.redacted_check)
         self.errors_check = self.Gtk.CheckButton(label="Has extraction errors")
         self.errors_check.connect(
             "toggled", self._on_boolean_filter, "extraction_errors_only"
         )
-        filters.append(self.errors_check)
-        self.bookmarks_check = self.Gtk.CheckButton(label="Bookmarked sessions")
-        self.bookmarks_check.connect("toggled", self._on_boolean_filter, "bookmarked_only")
-        filters.append(self.bookmarks_check)
-        self.sync_on_launch_check = self.Gtk.CheckButton(label="Sync on launch")
-        self.sync_on_launch_check.connect("toggled", self._on_sync_setting_changed)
-        filters.append(self.sync_on_launch_check)
-        self.periodic_sync_check = self.Gtk.CheckButton(
-            label="Sync every 5 minutes while open"
-        )
-        self.periodic_sync_check.connect("toggled", self._on_sync_setting_changed)
-        filters.append(self.periodic_sync_check)
+        advanced.append(self.errors_check)
+        self.advanced_filters = self.Gtk.Expander(label="Advanced filters")
+        self.advanced_filters.set_child(advanced)
+        filters.append(self.advanced_filters)
         outer.append(filters)
 
+        feedback = self.Gtk.Box(
+            orientation=self.Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+            margin_start=12,
+            margin_end=12,
+            margin_bottom=8,
+        )
+        self.filter_status = self.Gtk.Label(label="", xalign=0, hexpand=True)
+        self.filter_status.add_css_class("caption")
+        feedback.append(self.filter_status)
+        self.clear_filters_button = self.Gtk.Button(label="Clear all")
+        self.clear_filters_button.add_css_class("flat")
+        self.clear_filters_button.connect("clicked", self._clear_filters)
+        self.clear_filters_button.set_visible(False)
+        feedback.append(self.clear_filters_button)
+        outer.append(feedback)
+
         self.sync_status = self.Gtk.Label(
-            label=self._stored_sync_status(),
+            label="Loading generated journals…",
             xalign=0,
             wrap=True,
             margin_start=12,
@@ -405,65 +477,53 @@ class JournalWindow:
     def _build_main(self) -> object:
         toolbar = self.Adw.ToolbarView()
         header = self.Adw.HeaderBar()
-        back = self.Gtk.Button(icon_name="go-previous-symbolic", tooltip_text="Back to sessions")
-        back.connect("clicked", lambda *_args: self.split.set_show_content(False))
-        self._accessible(back, "Back to session list")
-        header.pack_start(back)
+        self.main_title = self.Adw.WindowTitle(
+            title="Journal", subtitle="Choose a generated session"
+        )
+        header.set_title_widget(self.main_title)
         self.open_project_button = self.Gtk.Button(
             icon_name="folder-open-symbolic", tooltip_text="Open validated project directory"
         )
         self._accessible(self.open_project_button, "Open validated project directory")
         self.open_project_button.connect("clicked", lambda *_args: self._open_project())
         header.pack_end(self.open_project_button)
-        self.copy_entry_button = self.Gtk.Button(
-            icon_name="edit-copy-symbolic", tooltip_text="Copy current sanitized entry"
+        self.select_mode_button = self.Gtk.ToggleButton(label="Select")
+        self.select_mode_button.set_tooltip_text("Select a sanitized timeline range")
+        self.select_mode_button.connect("toggled", self._on_selection_mode_toggled)
+        header.pack_end(self.select_mode_button)
+        journal_menu = self.Gio.Menu()
+        journal_menu.append("Copy current entry", "win.copy-entry")
+        journal_menu.append("Bookmark current entry", "win.bookmark")
+        journal_menu.append("Bookmark current session", "win.bookmark-session")
+        journal_menu.append("Compare recent sessions", "win.compare")
+        journal_menu.append("Journal activity", "win.activity")
+        journal_menu.append("Preview and export…", "win.export")
+        journal_menu.append("Session details", "win.toggle-details")
+        self.more_actions_button = self.Gtk.MenuButton(
+            icon_name="open-menu-symbolic",
+            tooltip_text="More journal actions",
         )
-        self._accessible(self.copy_entry_button, "Copy current sanitized entry")
-        self.copy_entry_button.connect("clicked", lambda *_args: self._copy_current_entry())
-        header.pack_end(self.copy_entry_button)
-        self.copy_range_button = self.Gtk.Button(
-            icon_name="edit-select-all-symbolic",
-            tooltip_text="Copy selected sanitized entry range",
-        )
-        self._accessible(self.copy_range_button, "Copy selected sanitized entry range")
-        self.copy_range_button.connect("clicked", lambda *_args: self._copy_selected_range())
-        header.pack_end(self.copy_range_button)
-        self.bookmark_entry_button = self.Gtk.Button(
-            icon_name="starred-symbolic", tooltip_text="Bookmark or unbookmark current entry"
-        )
-        self._accessible(self.bookmark_entry_button, "Bookmark or unbookmark current entry")
-        self.bookmark_entry_button.connect("clicked", lambda *_args: self._toggle_entry_bookmark())
-        header.pack_end(self.bookmark_entry_button)
-        self.bookmark_session_button = self.Gtk.Button(
-            icon_name="non-starred-symbolic", tooltip_text="Bookmark or unbookmark current session"
-        )
-        self._accessible(self.bookmark_session_button, "Bookmark or unbookmark current session")
-        self.bookmark_session_button.connect(
-            "clicked", lambda *_args: self._toggle_session_bookmark()
-        )
-        header.pack_end(self.bookmark_session_button)
-        self.compare_button = self.Gtk.Button(
-            icon_name="view-grid-symbolic",
-            tooltip_text="Compare two most recently viewed sessions",
-        )
-        self._accessible(self.compare_button, "Compare two most recently viewed sessions")
-        self.compare_button.connect("clicked", lambda *_args: self._compare_recent())
-        header.pack_end(self.compare_button)
-        self.activity_button = self.Gtk.Button(
-            icon_name="x-office-calendar-symbolic",
-            tooltip_text="Open daily, weekly, and project activity",
-        )
-        self._accessible(self.activity_button, "Open journal activity calendar")
-        self.activity_button.connect("clicked", lambda *_args: self._open_activity())
-        header.pack_end(self.activity_button)
-        self.export_button = self.Gtk.Button(
-            icon_name="document-save-as-symbolic",
-            tooltip_text="Preview and export reviewed material",
-        )
-        self._accessible(self.export_button, "Preview and export reviewed material")
-        self.export_button.connect("clicked", lambda *_args: self._open_export_preview())
-        header.pack_end(self.export_button)
+        self.more_actions_button.set_menu_model(journal_menu)
+        self._accessible(self.more_actions_button, "Open more journal actions")
+        header.pack_end(self.more_actions_button)
         toolbar.add_top_bar(header)
+
+        self.selection_bar = self.Gtk.Revealer()
+        selection_actions = self.Gtk.ActionBar()
+        self.selection_count = self.Gtk.Label(label="0 selected")
+        selection_actions.pack_start(self.selection_count)
+        cancel_selection = self.Gtk.Button(label="Cancel")
+        cancel_selection.connect("clicked", lambda *_args: self._set_selection_mode(False))
+        selection_actions.pack_end(cancel_selection)
+        self.copy_selection_button = self.Gtk.Button(label="Copy selected")
+        self.copy_selection_button.add_css_class("suggested-action")
+        self.copy_selection_button.set_sensitive(False)
+        self.copy_selection_button.connect(
+            "clicked", lambda *_args: self._copy_selected_range()
+        )
+        selection_actions.pack_end(self.copy_selection_button)
+        self.selection_bar.set_child(selection_actions)
+        toolbar.add_top_bar(self.selection_bar)
 
         self.main_stack = self.Gtk.Stack()
         self.main_stack.set_transition_type(self.Gtk.StackTransitionType.CROSSFADE)
@@ -513,7 +573,50 @@ class JournalWindow:
         return toolbar
 
     def _show_state(self, name: str) -> None:
+        if name != "content":
+            self.current_detail = None
+            self.details_expander = None
+            self._set_selection_mode(False)
         self.main_stack.set_visible_child_name(name)
+        if name == "loading":
+            self.main_title.set_title("Journal")
+            self.main_title.set_subtitle("Loading generated journals")
+        elif name == "empty":
+            self.main_title.set_title("Journal")
+            self.main_title.set_subtitle("No generated journals")
+        elif name == "unselected":
+            self.main_title.set_title("Journal")
+            self.main_title.set_subtitle("Choose a generated session")
+        elif name == "error":
+            self.main_title.set_title("Journal unavailable")
+            self.main_title.set_subtitle("Generated artifact failed validation")
+        self._update_action_availability()
+
+    def _update_action_availability(self) -> None:
+        detail_ready = bool(self.current_detail and self.current_detail.entries)
+        session_ready = self.current_detail is not None and self.model.selected is not None
+        states = {
+            "open-project": session_ready,
+            "copy-entry": detail_ready,
+            "copy-range": detail_ready,
+            "selection-mode": detail_ready,
+            "bookmark": detail_ready,
+            "bookmark-session": session_ready,
+            "compare": len(set(self._recent_session_ids[-2:])) == 2,
+            "activity": bool(self.catalog.sessions),
+            "export": bool(
+                detail_ready or self._comparison_report is not None or self._activity_report is not None
+            ),
+            "toggle-details": self.details_expander is not None,
+        }
+        for name, enabled in states.items():
+            action = self.window.lookup_action(name)
+            if action is not None:
+                action.set_enabled(enabled)
+        if hasattr(self, "open_project_button"):
+            self.open_project_button.set_sensitive(session_ready)
+        if hasattr(self, "select_mode_button"):
+            self.select_mode_button.set_sensitive(detail_ready)
 
     def refresh_catalog(self, *, rebuild_index: bool = True) -> bool:
         if self._loading:
@@ -536,6 +639,7 @@ class JournalWindow:
                 self.search_index = JournalSearchIndex(search_path)
             if rebuild_index:
                 self.search_index.rebuild(self.catalog)
+            self._session_summaries = self.search_index.session_summaries()
             self._populate_filters()
             self._restore_state()
             self._state_restored = True
@@ -599,6 +703,7 @@ class JournalWindow:
             window_height=max(480, self.window.get_height()),
             content_visible=self.split.get_show_content(),
             timeline_entry_index=self.current_entry_index,
+            timeline_density=self.timeline_density,
             last_sync_at=self.last_sync_at,
             last_sync_summary=self.last_sync_summary,
         )
@@ -607,19 +712,24 @@ class JournalWindow:
         widget.update_property([self.Gtk.AccessibleProperty.LABEL], [label])
 
     def _restore_state(self) -> None:
+        restored_advanced = False
         for field, value in self.saved_state.filters.items():
             if field in self._filter_widgets and isinstance(value, str):
                 self._select_dropdown_value(self._filter_widgets[field], value)
                 self.model.set_filter(field, value)
+                restored_advanced = restored_advanced or field not in {"project", "status"}
             elif field == "redacted_only" and isinstance(value, bool):
                 self.redacted_check.set_active(value)
                 self.model.set_filter(field, value)
+                restored_advanced = restored_advanced or value
             elif field == "extraction_errors_only" and isinstance(value, bool):
                 self.errors_check.set_active(value)
                 self.model.set_filter(field, value)
+                restored_advanced = restored_advanced or value
             elif field == "bookmarked_only" and isinstance(value, bool):
                 self.bookmarks_check.set_active(value)
                 self.model.set_filter(field, value)
+        self.advanced_filters.set_expanded(restored_advanced)
         session_id = self.saved_state.selected_session_id
         if session_id and any(item.session_id == session_id for item in self.model.sessions):
             self.model.select(session_id)
@@ -666,22 +776,29 @@ class JournalWindow:
         return item.get_string() if item is not None else None
 
     def _on_filter_changed(self, dropdown: object, _pspec: object, field: str) -> None:
-        if self._loading:
+        if self._loading or self._updating_filters:
             return
         self.model.set_filter(field, self._selected_text(dropdown))
         self._apply_search()
         self._populate_sessions()
 
     def _on_boolean_filter(self, button: object, field: str) -> None:
-        if self._loading:
+        if self._loading or self._updating_filters:
             return
         self.model.set_filter(field, bool(button.get_active()))
         self._populate_sessions()
 
     def _stored_sync_status(self) -> str:
+        loaded = len(self.catalog.sessions)
         if not self.last_sync_at:
-            return "Not synced by the viewer yet."
-        return f"Last successful sync: {self.last_sync_at}\n{self.last_sync_summary or ''}".strip()
+            return (
+                f"Displaying {loaded} generated journal(s). "
+                "Viewer sync has not run; source freshness is not claimed."
+            )
+        return (
+            f"Displaying {loaded} generated journal(s). "
+            f"Last viewer sync: {self.last_sync_at}\n{self.last_sync_summary or ''}"
+        ).strip()
 
     def _on_sync_setting_changed(self, _button: object) -> None:
         if not self._loading and self._launch_sync_started:
@@ -749,7 +866,7 @@ class JournalWindow:
         return False
 
     def _on_search_changed(self, _entry: object) -> None:
-        if self._loading:
+        if self._loading or self._updating_filters:
             return
         self._apply_search()
         self._populate_sessions()
@@ -774,12 +891,44 @@ class JournalWindow:
         while child := box.get_first_child():
             box.remove(child)
 
+    def _clear_filters(self, *_args: object) -> None:
+        self._updating_filters = True
+        try:
+            self.search_entry.set_text("")
+            for dropdown in self._filter_widgets.values():
+                dropdown.set_selected(0)
+            self.redacted_check.set_active(False)
+            self.errors_check.set_active(False)
+            self.bookmarks_check.set_active(False)
+            self.model.filters = BrowserFilters()
+            self.model.set_search_hits((), active=False)
+            self.model.set_session_subset(None)
+            self._hits_by_session.clear()
+        finally:
+            self._updating_filters = False
+        self._populate_sessions()
+
+    def _filter_count(self) -> int:
+        values = asdict(self.model.filters)
+        return sum(value not in (None, False, "") for value in values.values()) + int(
+            bool(self.search_entry.get_text().strip())
+        )
+
+    def _update_filter_feedback(self) -> None:
+        count = self._filter_count()
+        self.clear_filters_button.set_visible(bool(count))
+        self.filter_status.set_label(
+            f"{count} active filter{'s' if count != 1 else ''}" if count else ""
+        )
+
     def _populate_sessions(self) -> None:
         self._session_rows.clear()
         self._clear_box(self.session_list)
         sessions = self.model.sessions
         counts = self.model.counts
         self.count_label.set_label(f"{counts.visible} of {counts.total} sessions")
+        self.sync_status.set_label(self._stored_sync_status())
+        self._update_filter_feedback()
         for session in sessions:
             row = self.Gtk.ListBoxRow()
             row.set_activatable(True)
@@ -822,6 +971,13 @@ class JournalWindow:
         if session.extraction_error_count or session.redaction_count:
             badges.add_css_class("warning")
         box.append(badges)
+        summary_text = self._session_summaries.get(session.session_id)
+        if summary_text:
+            summary = concise_session_summary(summary_text)
+            focus = self.Gtk.Label(label=summary, xalign=0, ellipsize=3)
+            focus.add_css_class("caption")
+            focus.set_tooltip_text(summary_text)
+            box.append(focus)
         if self.annotations.is_bookmarked(AnnotationTarget(session.session_id)):
             bookmarked = self.Gtk.Label(label="★ session bookmark", xalign=0)
             bookmarked.add_css_class("accent")
@@ -847,7 +1003,7 @@ class JournalWindow:
             self._recent_session_ids.remove(session_id)
         self._recent_session_ids.append(session_id)
         self._recent_session_ids = self._recent_session_ids[-10:]
-        self._selected_entry_indexes.clear()
+        self._set_selection_mode(False)
         self._render_session(session_id)
         if self.split.get_collapsed():
             self.split.set_show_content(True)
@@ -856,6 +1012,8 @@ class JournalWindow:
         try:
             detail = self.catalog.load_detail(session_id)
         except (CatalogError, ValueError):
+            self.main_title.set_title("Journal unavailable")
+            self.main_title.set_subtitle("Generated artifact failed validation")
             self.error_page.set_title("Generated journal is malformed")
             self.error_page.set_description(
                 "The selected generated artifact failed validation and was not displayed. "
@@ -865,18 +1023,13 @@ class JournalWindow:
             return
         self._clear_box(self.content_box)
         self._timeline_widgets.clear()
+        self._selection_checks.clear()
         self.current_detail = detail
         session = detail.session
-        title = self.Gtk.Label(label=session.project, xalign=0, selectable=True)
-        title.add_css_class("title-1")
-        self.content_box.append(title)
-        subtitle = self.Gtk.Label(
-            label=f"{display_start(session)} · {session.branch or 'No branch'} · {session.status}",
-            xalign=0,
-            selectable=True,
+        self.main_title.set_title(session.project)
+        self.main_title.set_subtitle(
+            f"{display_start(session)} · {session.branch or 'No branch'} · {session.status}"
         )
-        subtitle.add_css_class("dim-label")
-        self.content_box.append(subtitle)
         self.action_status = self.Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
         self.action_status.add_css_class("caption")
         self.content_box.append(self.action_status)
@@ -916,7 +1069,6 @@ class JournalWindow:
                 widget = self._timeline_row(session, presented)
                 if presented.entry.index == target_index:
                     widget.add_css_class("accent")
-                    widget.set_expanded(True)
                     target_widget = widget
                 self._timeline_widgets[presented.entry.index] = widget
                 timeline.append(widget)
@@ -972,7 +1124,11 @@ class JournalWindow:
             self._set_action_status("One generated session failed comparison validation.", warning=True)
             return
         self._comparison_report = report
+        self._set_selection_mode(False)
         self.current_detail = None
+        self.details_expander = None
+        self.main_title.set_title("Session comparison")
+        self.main_title.set_subtitle("Two recently viewed generated journals")
         self._clear_box(self.content_box)
         title = self.Gtk.Label(label="Session comparison", xalign=0)
         title.add_css_class("title-1")
@@ -1063,7 +1219,11 @@ class JournalWindow:
             if self._activity_running:
                 return
             self._activity_running = True
+            self._set_selection_mode(False)
             self.current_detail = None
+            self.details_expander = None
+            self.main_title.set_title("Journal activity")
+            self.main_title.set_subtitle("Generated sessions and visible entries only")
             self._clear_box(self.content_box)
             loading = self.Adw.StatusPage(
                 title="Building journal activity",
@@ -1106,7 +1266,11 @@ class JournalWindow:
         return False
 
     def _build_activity_view(self) -> None:
+        self._set_selection_mode(False)
         self.current_detail = None
+        self.details_expander = None
+        self.main_title.set_title("Journal activity")
+        self.main_title.set_subtitle("Generated sessions and visible entries only")
         self._clear_box(self.content_box)
         title = self.Gtk.Label(label="Journal activity", xalign=0)
         title.add_css_class("title-1")
@@ -1413,17 +1577,20 @@ class JournalWindow:
     def _timeline_row(self, session: CatalogSession, presented: PresentedEntry) -> object:
         row = self.Gtk.Expander()
         row.add_css_class("card")
+        compact = self.timeline_density == "compact"
         heading = self.Gtk.Box(
             orientation=self.Gtk.Orientation.HORIZONTAL,
-            spacing=12,
-            margin_top=10,
-            margin_bottom=10,
+            spacing=8 if compact else 12,
+            margin_top=5 if compact else 10,
+            margin_bottom=5 if compact else 10,
             margin_start=12,
             margin_end=12,
         )
         selected = self.Gtk.CheckButton()
         self._accessible(selected, f"Include journal entry at {presented.display_time} in copy range")
         selected.connect("toggled", self._on_entry_selected, presented.entry.index)
+        selected.set_visible(self.selection_mode)
+        self._selection_checks[presented.entry.index] = selected
         timestamp = self.Gtk.Label(label=presented.display_time, xalign=0, yalign=0)
         timestamp.add_css_class("monospace")
         timestamp.add_css_class("dim-label")
@@ -1431,8 +1598,9 @@ class JournalWindow:
         body = self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=5)
         body.set_hexpand(True)
         message = self.Gtk.Label(
-            label=presented.entry.text, xalign=0, wrap=True, selectable=True
+            xalign=0, wrap=True, selectable=True
         )
+        message.set_markup(safe_inline_markup(presented.entry.text))
         message.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         body.append(message)
         labels = (*presented.tags, *presented.indicators)
@@ -1440,11 +1608,31 @@ class JournalWindow:
         if self.annotations.is_bookmarked(target):
             labels = (*labels, "★ bookmarked")
         if labels:
-            tags = self.Gtk.Label(label="  ·  ".join(labels), xalign=0)
-            tags.add_css_class("caption")
-            if "failure" in labels or "security" in labels or "redacted" in labels:
-                tags.add_css_class("warning")
-            body.append(tags)
+            badges = self.Gtk.FlowBox(
+                selection_mode=self.Gtk.SelectionMode.NONE,
+                column_spacing=5,
+                row_spacing=5,
+                max_children_per_line=8,
+                min_children_per_line=1,
+                homogeneous=False,
+                halign=self.Gtk.Align.START,
+            )
+            for value in labels:
+                badge = self.Gtk.Label(label=value)
+                badge.add_css_class("caption")
+                badge.set_margin_top(2)
+                badge.set_margin_bottom(2)
+                badge.set_margin_start(6)
+                badge.set_margin_end(6)
+                if value in {"failure", "security", "blocker", "stop", "redacted"}:
+                    badge.add_css_class("warning")
+                elif value in {"correction", "test"}:
+                    badge.add_css_class("success")
+                frame = self.Gtk.Frame()
+                frame.add_css_class("card")
+                frame.set_child(badge)
+                badges.append(frame)
+            body.append(badges)
         heading.append(selected)
         heading.append(timestamp)
         heading.append(body)
@@ -1454,10 +1642,40 @@ class JournalWindow:
         return row
 
     def _on_entry_selected(self, button: object, entry_index: int) -> None:
+        if self._updating_selection:
+            return
         if button.get_active():
             self._selected_entry_indexes.add(entry_index)
         else:
             self._selected_entry_indexes.discard(entry_index)
+        self._update_selection_count()
+
+    def _on_selection_mode_toggled(self, button: object) -> None:
+        if not self._updating_selection:
+            self._set_selection_mode(bool(button.get_active()))
+
+    def _set_selection_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled and self.current_detail is not None and self.current_detail.entries)
+        self.selection_mode = enabled
+        self._updating_selection = True
+        try:
+            if self.select_mode_button.get_active() != enabled:
+                self.select_mode_button.set_active(enabled)
+            for checkbox in self._selection_checks.values():
+                checkbox.set_visible(enabled)
+                if not enabled:
+                    checkbox.set_active(False)
+            if not enabled:
+                self._selected_entry_indexes.clear()
+        finally:
+            self._updating_selection = False
+        self.selection_bar.set_reveal_child(enabled)
+        self._update_selection_count()
+
+    def _update_selection_count(self) -> None:
+        count = len(self._selected_entry_indexes)
+        self.selection_count.set_label(f"{count} selected")
+        self.copy_selection_button.set_sensitive(count > 0)
 
     def _set_action_status(self, message: str, *, warning: bool = False) -> None:
         if self.action_status is None:
@@ -1496,6 +1714,10 @@ class JournalWindow:
 
     def _copy_selected_range(self) -> None:
         detail = self.current_detail
+        if detail is not None and not self._selected_entry_indexes:
+            self._set_selection_mode(True)
+            self._set_action_status("Select the journal entries to copy, then choose Copy selected.")
+            return
         try:
             if detail is None:
                 raise ValueError("No timeline entries are selected.")
@@ -1507,6 +1729,7 @@ class JournalWindow:
         self._set_action_status(
             f"Copied {payload.entry_count} sanitized journal entries with timestamps."
         )
+        self._set_selection_mode(False)
 
     def _current_entry_target(self) -> AnnotationTarget | None:
         detail = self.current_detail
