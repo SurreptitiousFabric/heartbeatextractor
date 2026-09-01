@@ -23,7 +23,6 @@ from .viewer_catalog import (
     CatalogSession,
     JournalCatalog,
     JournalSearchIndex,
-    SearchFilters,
     SearchHit,
 )
 from .viewer_compare import ComparisonReport, compare_details, filter_timeline
@@ -879,7 +878,7 @@ class JournalWindow:
         active = bool(query.strip() or tag)
         hits = self.search_index.search(
             query,
-            filters=SearchFilters(tags=(tag,) if tag else ()),
+            tags=(tag,) if tag else (),
             limit=1000,
         ) if active else ()
         self.model.set_search_hits(hits, active=active)

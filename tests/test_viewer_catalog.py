@@ -11,8 +11,8 @@ from codex_journal.viewer_catalog import (
     CatalogError,
     JournalCatalog,
     JournalSearchIndex,
-    SearchFilters,
 )
+from codex_journal.viewer_model import SessionBrowserModel
 from codex_journal.viewer_tags import classify_entry
 
 
@@ -79,26 +79,46 @@ class ViewerCatalogTests(unittest.TestCase):
             if detail.entries:
                 self.assertEqual(summaries[session.session_id], detail.entries[0].text)
 
-    def test_search_filters_safe_metadata_tags_and_flags(self) -> None:
+    def test_search_schema_contains_only_text_tag_and_navigation_fields(self) -> None:
+        with JournalSearchIndex(self.root / "schema.sqlite3") as index:
+            columns = tuple(
+                row[1] for row in index.connection.execute("PRAGMA table_info(journal_search)")
+            )
+            version = index.connection.execute(
+                "SELECT value FROM viewer_index_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        self.assertEqual(columns, ("session_id", "entry_index", "timestamp_utc", "text", "tags"))
+        self.assertEqual(version, ("3",))
+
+    def test_search_tags_compose_with_authoritative_browser_metadata_filters(self) -> None:
         database = self.repo / "state" / "viewer.sqlite3"
-        session = self.catalog.sessions[0]
-        detail = self.catalog.load_detail(session.session_id)
-        tagged = next((entry for entry in detail.entries if classify_entry(entry.text)), None)
+        tagged = next(
+            (
+                (session, entry)
+                for session in self.catalog.sessions
+                for entry in self.catalog.load_detail(session.session_id).entries
+                if classify_entry(entry.text)
+            ),
+            None,
+        )
+        self.assertIsNotNone(tagged)
+        assert tagged is not None
+        session, entry = tagged
+        tag = classify_entry(entry.text)[0]
         with JournalSearchIndex(database) as index:
             index.rebuild(self.catalog)
-            by_project = index.search("", filters=SearchFilters(project=session.project))
-            self.assertTrue(by_project)
-            self.assertTrue(all(hit.project == session.project for hit in by_project))
-            ranged = index.search(
-                "",
-                filters=SearchFilters(date_from=session.local_date, date_to=session.local_date),
-            )
-            self.assertTrue(ranged)
-            if tagged is not None:
-                tag = classify_entry(tagged.text)[0]
-                hits = index.search("", filters=SearchFilters(tags=(tag,)))
-                self.assertTrue(hits)
-                self.assertTrue(all(tag in hit.tags for hit in hits))
+            hits = index.search("", tags=(tag,))
+        self.assertTrue(hits)
+        browser = SessionBrowserModel(self.catalog)
+        browser.set_search_hits(hits, active=True)
+        browser.set_filter("project", session.project)
+        browser.set_filter("status", session.status)
+        browser.set_filter("date_from", session.local_date)
+        browser.set_filter("date_to", session.local_date)
+        self.assertTrue(browser.sessions)
+        hit_ids = {hit.session_id for hit in hits}
+        self.assertTrue(all(item.session_id in hit_ids for item in browser.sessions))
+        self.assertTrue(all(item.project == session.project for item in browser.sessions))
 
     def test_index_rebuild_does_not_fill_lazy_detail_cache(self) -> None:
         self.catalog._details.clear()
@@ -118,7 +138,7 @@ class ViewerCatalogTests(unittest.TestCase):
         with JournalSearchIndex(self.repo / "state" / "viewer.sqlite3") as index:
             index.rebuild(self.catalog)
             with self.assertRaisesRegex(CatalogError, "unknown deterministic"):
-                index.search("", filters=SearchFilters(tags=("invented",)))
+                index.search("", tags=("invented",))
 
     def test_corrupt_and_symlinked_search_state_fail_closed(self) -> None:
         corrupt = self.repo / "state" / "corrupt.sqlite3"

@@ -93,10 +93,6 @@ class ViewerModelTests(unittest.TestCase):
             7,
             session.started_at_utc,
             "Safe matching context.",
-            session.project,
-            session.branch,
-            ("test",),
-            False,
         )
         visible = self.model.set_search_hits((hit,), active=True)
         self.assertEqual([item.session_id for item in visible], [session.session_id])

@@ -86,23 +86,6 @@ class SearchHit:
     entry_index: int
     timestamp_utc: str
     text: str
-    project: str
-    branch: str | None
-    tags: tuple[str, ...]
-    redacted: bool
-
-
-@dataclass(frozen=True)
-class SearchFilters:
-    project: str | None = None
-    date_from: str | None = None
-    date_to: str | None = None
-    branch: str | None = None
-    status: str | None = None
-    redacted_only: bool = False
-    extraction_errors_only: bool = False
-    source_kind: str | None = None
-    tags: tuple[str, ...] = ()
 
 
 def _safe_relative(path: Path, root: Path) -> str:
@@ -282,10 +265,10 @@ class JournalSearchIndex:
             version = self.connection.execute(
                 "SELECT value FROM viewer_index_meta WHERE key = 'schema_version'"
             ).fetchone()
-            if version != ("2",):
+            if version != ("3",):
                 self.connection.execute("DROP TABLE IF EXISTS journal_search")
                 self.connection.execute(
-                    "INSERT OR REPLACE INTO viewer_index_meta(key, value) VALUES ('schema_version', '2')"
+                    "INSERT OR REPLACE INTO viewer_index_meta(key, value) VALUES ('schema_version', '3')"
                 )
             self.connection.execute(
                 """
@@ -294,14 +277,7 @@ class JournalSearchIndex:
                     entry_index UNINDEXED,
                     timestamp_utc UNINDEXED,
                     text,
-                    project,
-                    branch,
-                    status UNINDEXED,
-                    source_kind UNINDEXED,
-                    local_date UNINDEXED,
                     tags,
-                    redacted UNINDEXED,
-                    extraction_errors UNINDEXED,
                     tokenize = 'unicode61'
                 )
                 """
@@ -332,14 +308,7 @@ class JournalSearchIndex:
                         entry.index,
                         entry.original_timestamp_utc,
                         entry.text,
-                        session.project,
-                        session.branch or "",
-                        session.status,
-                        session.source_kind,
-                        session.local_date,
                         " ".join(classify_entry(entry.text)),
-                        "1" if entry.redacted else "0",
-                        "1" if session.extraction_error_count else "0",
                     )
                     for entry in detail.entries
                 ]
@@ -347,9 +316,8 @@ class JournalSearchIndex:
                     self.connection.executemany(
                         """
                         INSERT INTO journal_search(
-                            session_id, entry_index, timestamp_utc, text, project, branch,
-                            status, source_kind, local_date, tags, redacted, extraction_errors
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            session_id, entry_index, timestamp_utc, text, tags
+                        ) VALUES (?, ?, ?, ?, ?)
                         """,
                         rows,
                     )
@@ -376,40 +344,20 @@ class JournalSearchIndex:
         self,
         query: str,
         *,
-        filters: SearchFilters | None = None,
+        tags: tuple[str, ...] = (),
         limit: int = 100,
     ) -> tuple[SearchHit, ...]:
         cleaned = " ".join(query.split())
-        selected = filters or SearchFilters()
-        if any(tag not in TAGS for tag in selected.tags):
+        if any(tag not in TAGS for tag in tags):
             raise CatalogError("unknown deterministic search tag")
-        if not cleaned and selected == SearchFilters():
+        if not cleaned and not tags:
             return ()
         clauses: list[str] = []
         parameters: list[object] = []
         if cleaned:
             clauses.append("journal_search MATCH ?")
             parameters.append('"' + cleaned.replace('"', '""') + '"')
-        for column, value in (
-            ("project", selected.project),
-            ("branch", selected.branch),
-            ("status", selected.status),
-            ("source_kind", selected.source_kind),
-        ):
-            if value:
-                clauses.append(f"{column} = ?")
-                parameters.append(value)
-        if selected.date_from:
-            clauses.append("local_date >= ?")
-            parameters.append(selected.date_from)
-        if selected.date_to:
-            clauses.append("local_date <= ?")
-            parameters.append(selected.date_to)
-        if selected.redacted_only:
-            clauses.append("redacted = '1'")
-        if selected.extraction_errors_only:
-            clauses.append("extraction_errors = '1'")
-        for tag in selected.tags:
+        for tag in tags:
             clauses.append("(' ' || tags || ' ') LIKE ?")
             parameters.append(f"% {tag} %")
         where = " AND ".join(clauses) if clauses else "1 = 1"
@@ -417,7 +365,7 @@ class JournalSearchIndex:
         try:
             rows = self.connection.execute(
                 f"""
-                SELECT session_id, entry_index, timestamp_utc, text, project, branch, tags, redacted
+                SELECT session_id, entry_index, timestamp_utc, text
                 FROM journal_search
                 WHERE {where}
                 ORDER BY timestamp_utc DESC, session_id, entry_index
@@ -433,10 +381,6 @@ class JournalSearchIndex:
                 int(row[1]),
                 row[2],
                 row[3],
-                row[4],
-                row[5] or None,
-                tuple(row[6].split()),
-                row[7] == "1",
             )
             for row in rows
         )
