@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 from codex_journal.engine import JournalEngine
@@ -29,6 +30,28 @@ except ViewerUnavailable:
     GTK_AVAILABLE = False
 
 
+@dataclass
+class ViewerHarness:
+    journal: object
+
+    def action(self, name: str) -> object:
+        action = self.journal.window.lookup_action(name)
+        if action is None:
+            raise AssertionError(f"missing window action: {name}")
+        return action
+
+    def activate(self, name: str) -> None:
+        self.action(name).activate(None)
+
+    def select_session(self, index: int) -> None:
+        sessions = self.journal.browser.session_list
+        sessions.select_row(sessions.get_row_at_index(index))
+
+    def close(self) -> None:
+        self.journal.close()
+        self.journal.window.destroy()
+
+
 @unittest.skipUnless(GTK_AVAILABLE, GTK_REASON)
 class ViewerGtkTests(unittest.TestCase):
     counter = 0
@@ -46,12 +69,11 @@ class ViewerGtkTests(unittest.TestCase):
             flags=Gio.ApplicationFlags.NON_UNIQUE,
         )
         self.assertTrue(self.app.register())
-        self.window: JournalWindow | None = None
+        self.harness: ViewerHarness | None = None
 
     def tearDown(self) -> None:
-        if self.window is not None:
-            self.window._on_close()
-            self.window.window.destroy()
+        if self.harness is not None:
+            self.harness.close()
         self.app.quit()
         self._drain()
         self.temp.cleanup()
@@ -67,17 +89,14 @@ class ViewerGtkTests(unittest.TestCase):
             timezone_name="Europe/Zurich"
         )
 
-    def _open(self) -> JournalWindow:
-        self.window = JournalWindow(
+    def _open(self) -> ViewerHarness:
+        window = JournalWindow(
             self.app, self.repo, self.state, (Adw, Gio, GLib, Gtk)
         )
-        self.window.present()
-        self.assertTrue(
-            self._spin_until(
-                lambda: self.window._state_restored and not self.window._loading
-            )
-        )
-        return self.window
+        window.present()
+        self.assertTrue(self._spin_until(lambda: window.ready))
+        self.harness = ViewerHarness(window)
+        return self.harness
 
     def _spin_until(self, condition: object, timeout: float = 8.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -105,7 +124,7 @@ class ViewerGtkTests(unittest.TestCase):
         self._fixture("normal_completed.jsonl")
         self._fixture("subagent.jsonl")
         self._generate()
-        window = self._open()
+        viewer = self._open()
         for action in (
             "previous-session",
             "next-session",
@@ -119,97 +138,101 @@ class ViewerGtkTests(unittest.TestCase):
             "export",
             "help",
         ):
-            self.assertIsNotNone(window.window.lookup_action(action), action)
-        self.assertEqual(len(window.model.sessions), 2)
-        window.session_list.select_row(window.session_list.get_row_at_index(1))
+            self.assertIsNotNone(viewer.action(action), action)
+        self.assertEqual(len(viewer.journal.browser.model.sessions), 2)
+        viewer.select_session(1)
         self._drain()
-        window._compare_recent()
-        self.assertIsNotNone(window._comparison_report)
-        self.assertEqual(len(window._recent_session_ids), 2)
+        viewer.activate("compare")
+        self.assertIsNotNone(viewer.journal.comparison.report)
+        self.assertEqual(len(viewer.journal.comparison.recent_session_ids), 2)
 
     def test_reworked_navigation_exposes_context_filters_and_reliable_help(self) -> None:
         self._fixture("normal_completed.jsonl")
         self._generate()
-        window = self._open()
-        session = window.model.selected
+        viewer = self._open()
+        window = viewer.journal
+        session = window.browser.model.selected
         self.assertIsNotNone(session)
         self.assertEqual(window.shortcuts_button.get_label(), "Keyboard shortcuts")
-        self.assertGreaterEqual(window.more_actions_button.get_menu_model().get_n_items(), 6)
+        self.assertGreaterEqual(window.timeline.more_actions_button.get_menu_model().get_n_items(), 6)
         self.assertEqual(window.main_title.get_title(), session.project)
         self.assertIn("Europe/Zurich", session.rendered_timezone)
-        self.assertIn("Displaying 1 generated journal", window.sync_status.get_label())
-        self.assertTrue(window._session_summaries[session.session_id])
+        self.assertIn("Displaying 1 generated journal", window.sync.status.get_label())
+        self.assertTrue(window.browser.summary(session.session_id))
 
-        project_filter = window._filter_widgets["project"]
+        project_filter = window.browser.filter_widget("project")
         project_filter.set_selected(1)
         self._drain()
-        self.assertTrue(window.clear_filters_button.get_visible())
-        self.assertIn("active filter", window.filter_status.get_label())
-        window._clear_filters()
+        self.assertTrue(window.browser.clear_filters_button.get_visible())
+        self.assertIn("active filter", window.browser.filter_status.get_label())
+        window.browser.clear_filters()
         self.assertEqual(project_filter.get_selected(), 0)
-        self.assertFalse(window.clear_filters_button.get_visible())
+        self.assertFalse(window.browser.clear_filters_button.get_visible())
 
     def test_selection_density_and_provenance_behaviors_are_explicit(self) -> None:
         self._fixture("normal_completed.jsonl")
         self._generate()
-        window = self._open()
-        self.assertTrue(window._timeline_widgets)
-        first_index = min(window._timeline_widgets)
-        first_row = window._timeline_widgets[first_index]
-        first_check = window._selection_checks[first_index]
+        viewer = self._open()
+        timeline = viewer.journal.timeline
+        self.assertTrue(timeline.indexes)
+        first_index = min(timeline.indexes)
+        first_row = timeline.row(first_index)
+        first_check = timeline.selection_checkbox(first_index)
         self.assertFalse(first_row.get_expanded())
         self.assertFalse(first_check.get_visible())
 
-        window._set_selection_mode(True)
-        self.assertTrue(window.selection_bar.get_reveal_child())
+        timeline.set_selection_mode(True)
+        self.assertTrue(timeline.selection_bar.get_reveal_child())
         self.assertTrue(first_check.get_visible())
         first_check.set_active(True)
         self._drain()
-        self.assertEqual(window.selection_count.get_label(), "1 selected")
-        self.assertTrue(window.copy_selection_button.get_sensitive())
-        window._set_selection_mode(False)
+        self.assertEqual(timeline.selection_count.get_label(), "1 selected")
+        self.assertTrue(timeline.copy_selection_button.get_sensitive())
+        timeline.set_selection_mode(False)
         self.assertFalse(first_check.get_visible())
-        self.assertEqual(window.selection_count.get_label(), "0 selected")
+        self.assertEqual(timeline.selection_count.get_label(), "0 selected")
 
-        window.density_dropdown.set_selected(1)
+        timeline.density_dropdown.set_selected(1)
         self._drain()
-        compact_row = window._timeline_widgets[min(window._timeline_widgets)]
+        compact_row = timeline.row(min(timeline.indexes))
         self.assertEqual(compact_row.get_label_widget().get_margin_top(), 5)
         tagged_index = next(
-            entry.index for entry in window.current_detail.entries if classify_entry(entry.text)
+            entry.index for entry in timeline.detail.entries if classify_entry(entry.text)
         )
-        tagged_body = window._timeline_widgets[tagged_index].get_label_widget().get_last_child()
+        tagged_body = timeline.row(tagged_index).get_label_widget().get_last_child()
         self.assertIsInstance(tagged_body.get_last_child(), Gtk.FlowBox)
-        window._move_entry(1)
-        self.assertFalse(window._timeline_widgets[window.current_entry_index].get_expanded())
+        viewer.activate("next-entry")
+        self.assertFalse(timeline.row(timeline.current_entry_index).get_expanded())
 
     def test_empty_and_malformed_generated_states_are_intentional(self) -> None:
         (self.repo / "journal").mkdir(parents=True)
-        window = self._open()
-        self.assertEqual(window.main_stack.get_visible_child_name(), "empty")
-        window._on_close()
-        window.window.destroy()
-        self.window = None
+        viewer = self._open()
+        self.assertEqual(viewer.journal.visible_state, "empty")
+        viewer.close()
+        self.harness = None
 
         malformed = self.repo / "journal" / "bad.md"
         malformed.write_text("not generated metadata\n", encoding="utf-8")
-        window = self._open()
-        self.assertEqual(window.main_stack.get_visible_child_name(), "error")
-        self.assertTrue(window.catalog.diagnostics)
+        viewer = self._open()
+        self.assertEqual(viewer.journal.visible_state, "error")
+        self.assertTrue(viewer.journal.browser.catalog.diagnostics)
 
     def test_async_sync_completes_without_blocking_widget_input(self) -> None:
         self._fixture("active_append.jsonl")
         self._generate()
-        window = self._open()
-        self.assertFalse(window._sync_running)
-        window._start_sync()
-        self.assertTrue(window._sync_running)
-        self.assertFalse(window._start_sync())
-        window.search_entry.set_text("safe query while syncing")
-        self.assertEqual(window.search_entry.get_text(), "safe query while syncing")
-        self.assertTrue(self._spin_until(lambda: not window._sync_running))
-        self.assertIsNotNone(window.last_sync_at)
-        self.assertIn("discovered=1", window.last_sync_summary)
+        viewer = self._open()
+        sync = viewer.journal.sync
+        self.assertFalse(sync.running)
+        viewer.activate("sync")
+        self.assertTrue(sync.running)
+        self.assertFalse(sync.start())
+        viewer.journal.browser.search_entry.set_text("safe query while syncing")
+        self.assertEqual(
+            viewer.journal.browser.search_entry.get_text(), "safe query while syncing"
+        )
+        self.assertTrue(self._spin_until(lambda: not sync.running))
+        self.assertIsNotNone(sync.last_sync_at)
+        self.assertIn("discovered=1", sync.last_sync_summary)
 
 
 if __name__ == "__main__":

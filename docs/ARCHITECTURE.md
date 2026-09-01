@@ -43,19 +43,25 @@ per session, plus root and project indexes. Provenance stores the source event
 sequence, exact UTC timestamp, hash of the original visible text, normalized
 text, and redaction flag—not the original unredacted body.
 
+`artifacts.py` is the one bounded, versioned decoder for generated journals,
+provenance, and indexes. The strict viewer rejects its first structured
+finding; `verify.py` retains all findings and checks source/state,
+journal/provenance, and indexes in separate phases.
+
 Generated artifacts are useful but not automatically public. They remain
 uncommitted until a person reviews them.
 
 ### Viewer catalog and search
 
-`viewer_catalog.py` reads bounded front matter eagerly and journal/provenance
+`viewer_catalog.py` reads bounded metadata eagerly and journal/provenance
 details lazily. It rejects malformed, oversized, duplicate, unsupported, or
 unknown data. It never imports or calls the raw parser.
 
-The FTS5 index in ignored `state/viewer.sqlite3` contains only generated safe
-entry text and safe metadata. It also supplies the bounded first-entry summary
-shown in each session row, avoiding raw-log access. It can be rebuilt
-atomically. Private notes and raw source fields are not indexed.
+The FTS5 index in ignored `state/viewer.sqlite3` contains generated safe entry
+text, deterministic tags, and the minimum fields needed to order and open a
+hit. `viewer_model.py` is the sole owner of metadata filtering. The index also
+supplies the bounded first-entry summary shown in each session row and can be
+rebuilt atomically. Private notes and raw source fields are not indexed.
 
 `viewer_tags.py` adds mechanical labels for failure, test, security, blocker,
 correction, commit, issue/PR, stop, and filename patterns. Tags do not rewrite
@@ -67,8 +73,12 @@ or infer meaning.
 `viewer_presenter.py` converts stored event timestamps into the journal's
 recorded timezone, bounds session summaries, escapes inline-code markup, and
 prepares date groups and visible indicators.
-`viewer_ui.py` owns the adaptive GTK widgets and starts potentially expensive
-sync or activity work in background threads. UI callbacks receive safe counts
+`viewer_ui.py` is a small composition shell for the application window,
+navigation, and action wiring. `viewer_ui_browser.py` owns catalog/search/filter
+state; `viewer_ui_timeline.py` owns timeline selection and annotations;
+`viewer_ui_sync.py` owns worker and timer lifecycle; and
+`viewer_ui_reports.py` gives comparison, activity, and export separate
+controllers. Cross-feature callbacks carry session IDs, booleans, safe counts,
 or error types rather than raw exception payloads.
 
 The application retains its Python controller for the whole window lifetime.
